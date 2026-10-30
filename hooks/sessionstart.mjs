@@ -136,8 +136,9 @@ await runHook(async () => {
     // Read the version this MCP boot is running under. PLUGIN_ROOT
     // points at ~/.claude/plugins/cache/context-mode/context-mode/<vX>/.
     let currentVersion = null;
+    let pluginRoot = null;
     try {
-      const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT
+      pluginRoot = process.env.CLAUDE_PLUGIN_ROOT
         ?? resolve(HOOK_DIR, "..");
       const manifestPath = resolve(pluginRoot, ".claude-plugin", "plugin.json");
       const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
@@ -146,7 +147,17 @@ await runHook(async () => {
       }
     } catch { /* missing/malformed manifest — skip self-heal */ }
 
-    if (currentVersion) {
+    // Only self-heal snapshots when this hook itself runs from the plugin
+    // cache — the same cache-residency condition pretooluse.mjs applies to
+    // its own self-heal. A plugin root outside the cache (a Nix/store
+    // build, a dev checkout) must not stamp its manifest version into
+    // ~/.claude/shell-snapshots/*.sh: the PATH entries it would write
+    // (…/plugins/cache/context-mode/context-mode/<version>/bin) do not
+    // exist for such installs, so every Bash call would lose the plugin's
+    // bin directory until a cache-rooted session heals them back.
+    const isInPluginCache = typeof pluginRoot === "string"
+      && (pluginRoot.includes("/plugins/cache/") || pluginRoot.includes("\\plugins\\cache\\"));
+    if (currentVersion && isInPluginCache) {
       const snapshotsDir = resolve(resolveConfigDir(), "shell-snapshots");
       const pluginCacheRoot = resolve(
         resolveConfigDir(),
