@@ -19,7 +19,7 @@
  * @see https://github.com/mksglu/context-mode/issues/203
  */
 
-import { existsSync, copyFileSync, renameSync, unlinkSync } from "node:fs";
+import { existsSync, copyFileSync, renameSync, unlinkSync, accessSync, constants } from "node:fs";
 import { execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -45,6 +45,13 @@ async function healBetterSqlite3Binding(pkgRoot) {
   }
 }
 
+// A plugin dir the user cannot write (a read-only store copy) can never receive
+// `npm install` or `npm rebuild`; attempting them on every hook call and MCP boot
+// only burns up to 120 s per call. Callers return early when this is false.
+function isWritableDir(dir) {
+  try { accessSync(dir, constants.W_OK); return true; } catch { return false; }
+}
+
 const NATIVE_DEPS = ["better-sqlite3"];
 const NATIVE_BINARIES = {
   "better-sqlite3": ["build", "Release", "better_sqlite3.node"],
@@ -67,6 +74,7 @@ function hasModernSqlite() {
 export async function ensureDeps() {
   // Bun ships bun:sqlite and never needs better-sqlite3
   if (typeof globalThis.Bun !== "undefined") return;
+  if (!isWritableDir(root)) return;
   for (const pkg of NATIVE_DEPS) {
     const pkgDir = resolve(root, "node_modules", pkg);
     if (!existsSync(pkgDir)) {
@@ -163,6 +171,9 @@ export function ensureNativeCompat(pluginRoot) {
     } catch { /* best effort — Bun never dlopens this file */ }
     return;
   }
+
+  // Nothing below can change a read-only plugin dir (copy, rebuild, swap).
+  if (!isWritableDir(pluginRoot)) return;
 
   // On Node >= 22.5, skip the child-process probe that can cause SIGSEGV (#331).
   // The binary install/rebuild still runs — only the dlopen probe is skipped.
