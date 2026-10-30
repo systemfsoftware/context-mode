@@ -10,9 +10,9 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, sep } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { loadDatabase as loadDatabaseImpl } from "../db-base.js";
 import { ensureSessionEventsSchema } from "./db.js";
 import { resolveClaudeConfigDir } from "../util/claude-config.js";
@@ -701,17 +701,232 @@ function autoMemoryPrefix(filename: string): string {
 }
 
 /**
+ * Bounded scan: a DB is re-opened only when it changed since its rollup entry
+ * was written (mtime/size of the main file and a non-empty WAL), so a store
+ * of tens of thousands of DBs that are not being written costs a stat each,
+ * not an open. A DB that changes on every refresh keeps its previous
+ * aggregate for this long before it is aggregated again.
+ */
+export const LIFETIME_REUSE_MS = 5 * 60 * 1000;
+
+/**
+ * Same, for a DB at least {@link LIFETIME_LARGE_DB_BYTES} big: its aggregate
+ * is several full-table scans, run synchronously on the MCP event loop.
+ */
+export const LIFETIME_REUSE_LARGE_MS = 60 * 60 * 1000;
+export const LIFETIME_LARGE_DB_BYTES = 256 * 1024 * 1024;
+
+function lifetimeReuseMs(dbBytes: number): number {
+  return dbBytes >= LIFETIME_LARGE_DB_BYTES ? LIFETIME_REUSE_LARGE_MS : LIFETIME_REUSE_MS;
+}
+
+/**
+ * Bounded-scan budget: DBs opened per call. A first run over a huge store (or
+ * after the rollup is lost) fills the rollup this many DBs per refresh instead
+ * of opening every DB in one synchronous pass.
+ */
+export const LIFETIME_MAX_OPENS_PER_CALL = 200;
+
+const LIFETIME_ROLLUP_FILE = "lifetime-rollup.json";
+const LIFETIME_ROLLUP_VERSION = 2;
+
+/** What `getLifetimeStats` sums from ONE session DB. */
+interface SessionDbAggregate {
+  events: number;
+  sessions: number;
+  categoryCounts: Record<string, number>;
+  rescueBytes: number;
+  /** Earliest event timestamp (ms epoch), null when the DB has none. */
+  firstEventMs: number | null;
+  projects: string[];
+}
+
+/**
+ * Persisted per-DB aggregate. Valid while (mtimeMs, size) still match the
+ * files, or for the reuse window after `at` (see {@link lifetimeReuseMs}).
+ */
+interface LifetimeRollupEntry extends SessionDbAggregate {
+  mtimeMs: number;
+  size: number;
+  /** When this aggregate was computed (ms epoch). */
+  at: number;
+  /** The DB could not be opened/read; the zero aggregate is retried after the reuse window. */
+  failed?: boolean;
+}
+
+function emptySessionDbAggregate(): SessionDbAggregate {
+  return { events: 0, sessions: 0, categoryCounts: {}, rescueBytes: 0, firstEventMs: null, projects: [] };
+}
+
+function isRollupEntry(v: unknown): v is LifetimeRollupEntry {
+  if (!v || typeof v !== "object") return false;
+  const e = v as Record<string, unknown>;
+  return typeof e.mtimeMs === "number"
+    && typeof e.size === "number"
+    && typeof e.at === "number"
+    && (e.failed === undefined || typeof e.failed === "boolean")
+    && typeof e.events === "number"
+    && typeof e.sessions === "number"
+    && typeof e.rescueBytes === "number"
+    && (e.firstEventMs === null || typeof e.firstEventMs === "number")
+    && Array.isArray(e.projects)
+    && e.projects.every((p) => typeof p === "string")
+    && !!e.categoryCounts
+    && typeof e.categoryCounts === "object"
+    && Object.values(e.categoryCounts as Record<string, unknown>).every((n) => typeof n === "number");
+}
+
+/** Best-effort read; a missing/corrupt/foreign-version rollup reads as empty. */
+function readLifetimeRollup(path: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as { version?: unknown; entries?: unknown };
+    if (parsed?.version === LIFETIME_ROLLUP_VERSION && parsed.entries && typeof parsed.entries === "object") {
+      return parsed.entries as Record<string, unknown>;
+    }
+  } catch { /* missing or corrupt — rebuilt by catch-up */ }
+  return {};
+}
+
+/**
+ * Every server rewrites the rollup whole, so before writing, fold in what a
+ * concurrent server recorded since this call read it: for a file still
+ * present, the entry with the later `at` wins. Best-effort, like the write.
+ */
+function mergeNewerRollupEntries(
+  path: string,
+  kept: Record<string, LifetimeRollupEntry>,
+  present: ReadonlySet<string>,
+): void {
+  const latest = readLifetimeRollup(path);
+  for (const [file, e] of Object.entries(latest)) {
+    if (!present.has(file) || !isRollupEntry(e)) continue;
+    const mine = kept[file];
+    if (!mine || e.at > mine.at) kept[file] = e;
+  }
+}
+
+/** Best-effort atomic write (tmp + rename); never throws. */
+function writeLifetimeRollup(path: string, entries: Record<string, LifetimeRollupEntry>): void {
+  const tmp = `${path}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify({ version: LIFETIME_ROLLUP_VERSION, entries }));
+    renameSync(tmp, path);
+  } catch {
+    try { unlinkSync(tmp); } catch { /* nothing to clean */ }
+  }
+}
+
+/**
+ * Change fingerprint of a session DB: mtime and combined size of the main
+ * file and its WAL. WAL-mode writes land in `-wal` and may leave the main file
+ * untouched for a long time, so a non-empty WAL counts toward both. An empty
+ * WAL is ignored: SQLite creates a 0-byte `-wal` on every read-only open, and
+ * that must not make an idle DB look freshly modified. undefined when the DB
+ * file is gone.
+ */
+function sessionDbStamp(dbPath: string): { mtimeMs: number; size: number } | undefined {
+  try {
+    const db = statSync(dbPath);
+    const wal = statSync(`${dbPath}-wal`, { throwIfNoEntry: false });
+    if (!wal || wal.size === 0) return { mtimeMs: db.mtimeMs, size: db.size };
+    return {
+      mtimeMs: Math.max(db.mtimeMs, wal.mtimeMs),
+      size: db.size + wal.size,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Open ONE session DB read-only and compute everything `getLifetimeStats`
+ * sums from it. Returns null when the DB cannot be opened / has no
+ * session_events + session_meta tables (corrupt, foreign file).
+ */
+function aggregateSessionDb(
+  DatabaseCtor: ReturnType<typeof loadDatabaseImpl>,
+  dbPath: string,
+): SessionDbAggregate | null {
+  try {
+    const sdb = new DatabaseCtor(dbPath, { readonly: true });
+    try {
+      const ev = sdb.prepare("SELECT COUNT(*) AS cnt FROM session_events").get() as { cnt: number } | undefined;
+      const ss = sdb.prepare("SELECT COUNT(*) AS cnt FROM session_meta").get() as { cnt: number } | undefined;
+      const agg = emptySessionDbAggregate();
+      agg.events = ev?.cnt ?? 0;
+      agg.sessions = ss?.cnt ?? 0;
+      // Per-category aggregation across every sidecar so the
+      // Persistent memory bars stay populated even when the
+      // current project's local DB is fresh / empty.
+      try {
+        const catRows = sdb.prepare(
+          "SELECT category, COUNT(*) AS cnt FROM session_events GROUP BY category",
+        ).all() as Array<{ category: string; cnt: number }>;
+        for (const row of catRows) {
+          if (!row.category) continue;
+          agg.categoryCounts[row.category] = (agg.categoryCounts[row.category] ?? 0) + (row.cnt ?? 0);
+        }
+      } catch {
+        // older schema / no category column — ignore
+      }
+      // Lifetime rescue: compact-snapshot bytes restored across every DB.
+      // Without this, the lifetime $ silently undercounts the killer
+      // continuity-after-/compact feature.
+      try {
+        const snap = sdb.prepare(
+          "SELECT COALESCE(SUM(length(snapshot)), 0) AS bytes FROM session_resume WHERE consumed = 1",
+        ).get() as { bytes: number } | undefined;
+        if (snap?.bytes) agg.rescueBytes += snap.bytes;
+      } catch { /* old schema */ }
+      // Earliest event timestamp + distinct project_dirs for the
+      // "since X · Y projects" lifetime narrative.
+      try {
+        const mn = sdb.prepare(
+          "SELECT MIN(created_at) AS t FROM session_events",
+        ).get() as { t: string | null } | undefined;
+        if (mn?.t) {
+          const stamp = mn.t.endsWith("Z") ? mn.t : mn.t + "Z";
+          const ms = Date.parse(stamp);
+          if (Number.isFinite(ms) && (agg.firstEventMs === null || ms < agg.firstEventMs)) agg.firstEventMs = ms;
+        }
+      } catch { /* old schema */ }
+      try {
+        const projRows = sdb.prepare(
+          "SELECT DISTINCT project_dir AS p FROM session_events WHERE project_dir != ''",
+        ).all() as Array<{ p: string }>;
+        for (const row of projRows) if (row.p) agg.projects.push(row.p);
+      } catch { /* old schema */ }
+      return agg;
+    } finally {
+      sdb.close();
+    }
+  } catch {
+    // missing tables / corrupt file — skip
+    return null;
+  }
+}
+
+/**
  * Aggregate lifetime stats from all SessionDB files in `sessionsDir` and
  * all auto-memory markdown files under `memoryRoot/<project>/memory/`.
  *
  * Best-effort: silently ignores missing/unreadable files so ctx_stats
  * can never be broken by a corrupt sidecar.
+ *
+ * By default every SessionDB is opened. The periodic statusline refresh
+ * passes `boundedScan: true` instead: a DB is opened only when it changed
+ * since its entry in `<sessionsDir>/../lifetime-rollup.json` (keyed by file
+ * name, valid while mtime+size match, or for {@link LIFETIME_REUSE_MS} after
+ * it was computed), at most {@link LIFETIME_MAX_OPENS_PER_CALL} DBs per
+ * call. The result for a fully warmed rollup equals the unbounded result.
  */
 export function getLifetimeStats(opts?: {
   sessionsDir?: string;
   memoryRoot?: string;
   /** Override for tests — defaults to db-base loadDatabase(). */
   loadDatabase?: () => unknown;
+  /** Periodic-refresh mode: open only DBs that changed since the rollup, serve the rest from it. */
+  boundedScan?: boolean;
 }): LifetimeStats {
   // Issue #460 round-3: route through resolveClaudeConfigDir so lifetime
   // stats aggregation tracks $CLAUDE_CONFIG_DIR instead of the literal
@@ -729,6 +944,16 @@ export function getLifetimeStats(opts?: {
   let firstEventMs = Number.POSITIVE_INFINITY;
   const distinctProjectsSet = new Set<string>();
   const categoryCounts: Record<string, number> = {};
+  const addAggregate = (a: SessionDbAggregate): void => {
+    totalEvents += a.events;
+    totalSessions += a.sessions;
+    rescueBytes += a.rescueBytes;
+    if (a.firstEventMs !== null && a.firstEventMs < firstEventMs) firstEventMs = a.firstEventMs;
+    for (const p of a.projects) distinctProjectsSet.add(p);
+    for (const [cat, n] of Object.entries(a.categoryCounts)) {
+      categoryCounts[cat] = (categoryCounts[cat] ?? 0) + n;
+    }
+  };
 
   // ── SessionDB aggregation ──
   if (existsSync(sessionsDir)) {
@@ -746,63 +971,58 @@ export function getLifetimeStats(opts?: {
           : loadDatabaseImpl();
       } catch { /* sqlite unavailable */ }
 
-      if (DatabaseCtor) {
+      if (DatabaseCtor && !opts?.boundedScan) {
+        for (const file of dbFiles) {
+          const agg = aggregateSessionDb(DatabaseCtor, join(sessionsDir, file));
+          if (agg) addAggregate(agg);
+        }
+      } else if (DatabaseCtor) {
+        const rollupPath = join(dirname(sessionsDir), LIFETIME_ROLLUP_FILE);
+        const cached = readLifetimeRollup(rollupPath);
+        // Entries this call keeps: the cached one while it is still valid,
+        // or the aggregate it recomputes. Entries of vanished DBs are dropped.
+        const kept: Record<string, LifetimeRollupEntry> = {};
+        const cachedCount = Object.keys(cached).length;
+        const present = new Set(dbFiles);
+        let recorded = 0;
+        let opens = 0;
+        const now = Date.now();
         for (const file of dbFiles) {
           const dbPath = join(sessionsDir, file);
-          try {
-            const sdb = new DatabaseCtor(dbPath, { readonly: true });
-            try {
-              const ev = sdb.prepare("SELECT COUNT(*) AS cnt FROM session_events").get() as { cnt: number } | undefined;
-              const ss = sdb.prepare("SELECT COUNT(*) AS cnt FROM session_meta").get() as { cnt: number } | undefined;
-              totalEvents += ev?.cnt ?? 0;
-              totalSessions += ss?.cnt ?? 0;
-              // Per-category aggregation across every sidecar so the
-              // Persistent memory bars stay populated even when the
-              // current project's local DB is fresh / empty.
-              try {
-                const catRows = sdb.prepare(
-                  "SELECT category, COUNT(*) AS cnt FROM session_events GROUP BY category",
-                ).all() as Array<{ category: string; cnt: number }>;
-                for (const row of catRows) {
-                  if (!row.category) continue;
-                  categoryCounts[row.category] = (categoryCounts[row.category] ?? 0) + (row.cnt ?? 0);
-                }
-              } catch {
-                // older schema / no category column — ignore
-              }
-              // Lifetime rescue: compact-snapshot bytes restored across every DB.
-              // Without this, the lifetime $ silently undercounts the killer
-              // continuity-after-/compact feature.
-              try {
-                const snap = sdb.prepare(
-                  "SELECT COALESCE(SUM(length(snapshot)), 0) AS bytes FROM session_resume WHERE consumed = 1",
-                ).get() as { bytes: number } | undefined;
-                if (snap?.bytes) rescueBytes += snap.bytes;
-              } catch { /* old schema */ }
-              // Earliest event timestamp + distinct project_dirs for the
-              // "since X · Y projects" lifetime narrative.
-              try {
-                const mn = sdb.prepare(
-                  "SELECT MIN(created_at) AS t FROM session_events",
-                ).get() as { t: string | null } | undefined;
-                if (mn?.t) {
-                  const stamp = mn.t.endsWith("Z") ? mn.t : mn.t + "Z";
-                  const ms = Date.parse(stamp);
-                  if (Number.isFinite(ms) && ms < firstEventMs) firstEventMs = ms;
-                }
-              } catch { /* old schema */ }
-              try {
-                const projRows = sdb.prepare(
-                  "SELECT DISTINCT project_dir AS p FROM session_events WHERE project_dir != ''",
-                ).all() as Array<{ p: string }>;
-                for (const row of projRows) if (row.p) distinctProjectsSet.add(row.p);
-              } catch { /* old schema */ }
-            } finally {
-              sdb.close();
+          const stamp = sessionDbStamp(dbPath);
+          if (!stamp) continue; // vanished between readdir and stat
+          const hit = Object.hasOwn(cached, file) ? cached[file] : undefined;
+          const entry = isRollupEntry(hit) ? hit : undefined;
+          if (entry) {
+            const unchanged = entry.mtimeMs === stamp.mtimeMs && entry.size === stamp.size;
+            // A DB that keeps changing (a project DB every session of a crew
+            // writes) is re-aggregated at most once per reuse window, not
+            // every refresh; a failed open is retried after the same window.
+            const fresh = now - entry.at < lifetimeReuseMs(stamp.size);
+            if ((unchanged && !entry.failed) || fresh) {
+              addAggregate(entry);
+              kept[file] = entry;
+              continue;
             }
-          } catch {
-            // missing tables / corrupt file — skip
           }
+          if (opens >= LIFETIME_MAX_OPENS_PER_CALL) {
+            // Over budget: the stale aggregate (if any) beats a zero; the
+            // rest of the work is picked up by the next calls.
+            if (entry) { addAggregate(entry); kept[file] = entry; }
+            continue;
+          }
+          opens++;
+          const agg = aggregateSessionDb(DatabaseCtor, dbPath);
+          const recomputed: LifetimeRollupEntry = agg
+            ? { mtimeMs: stamp.mtimeMs, size: stamp.size, at: now, ...agg }
+            : { mtimeMs: stamp.mtimeMs, size: stamp.size, at: now, failed: true, ...emptySessionDbAggregate() };
+          addAggregate(recomputed);
+          kept[file] = recomputed;
+          recorded++;
+        }
+        if (recorded > 0 || Object.keys(kept).length !== cachedCount) {
+          mergeNewerRollupEntries(rollupPath, kept, present);
+          writeLifetimeRollup(rollupPath, kept);
         }
       }
     }

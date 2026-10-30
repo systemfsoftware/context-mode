@@ -39,20 +39,57 @@ export interface PreparedStatement {
 // bun:sqlite adapter (#45)
 // ─────────────────────────────────────────────────────────
 
+/** The slice of a bun:sqlite Statement the adapter drives and releases. */
+interface BunStatement {
+  all(): Array<Record<string, unknown>>;
+  run(): unknown;
+  finalize?: () => void;
+}
+
 /**
  * Wraps a bun:sqlite Database to provide better-sqlite3-compatible API.
  * Bridges: .pragma(), multi-statement .exec(), .get() null→undefined.
+ *
+ * Statement lifetime: bun:sqlite's `Database#close(false)` only releases the
+ * underlying connection once every prepared statement has been finalized or
+ * garbage-collected. Statements that were never finalized therefore keep the
+ * connection (fds + page cache) alive until a GC pass, which let thousands of
+ * "closed" read-only session DBs pile up in a long-lived MCP server. Every
+ * statement prepared through this adapter is finalized in `close()`.
  */
 export class BunSQLiteAdapter {
   #raw: any;
+  // Statements handed out by prepare(). WeakRefs keep GC behaviour of
+  // long-lived connections unchanged (statements prepared per call are still
+  // collectable); dead refs are pruned whenever the set doubles.
+  #stmts = new Set<WeakRef<BunStatement>>();
+  #pruneAt = 256;
 
   constructor(rawDb: any) {
     this.#raw = rawDb;
   }
 
+  #track(stmt: BunStatement): void {
+    this.#stmts.add(new WeakRef(stmt));
+    if (this.#stmts.size < this.#pruneAt) return;
+    for (const ref of this.#stmts) {
+      if (ref.deref() === undefined) this.#stmts.delete(ref);
+    }
+    this.#pruneAt = Math.max(256, this.#stmts.size * 2);
+  }
+
+  /** Prepare a one-shot statement, run `fn` on it and always finalize it. */
+  #once<T>(sql: string, fn: (stmt: BunStatement) => T): T {
+    const stmt = this.#raw.prepare(sql);
+    try {
+      return fn(stmt);
+    } finally {
+      try { stmt.finalize?.(); } catch { /* already finalized */ }
+    }
+  }
+
   pragma(source: string): any {
-    const stmt = this.#raw.prepare(`PRAGMA ${source}`);
-    const rows = stmt.all();
+    const rows = this.#once(`PRAGMA ${source}`, (stmt) => stmt.all());
     if (!rows || rows.length === 0) return undefined;
     // Multi-row pragmas (table_xinfo, etc.) → return array
     if (rows.length > 1) return rows;
@@ -76,19 +113,20 @@ export class BunSQLiteAdapter {
         inString = ch;
       } else if (ch === ";") {
         const trimmed = current.trim();
-        if (trimmed) this.#raw.prepare(trimmed).run();
+        if (trimmed) this.#once(trimmed, (stmt) => stmt.run());
         current = "";
       } else {
         current += ch;
       }
     }
     const trimmed = current.trim();
-    if (trimmed) this.#raw.prepare(trimmed).run();
+    if (trimmed) this.#once(trimmed, (stmt) => stmt.run());
     return this;
   }
 
   prepare(sql: string): any {
     const stmt = this.#raw.prepare(sql);
+    this.#track(stmt);
     return {
       run: (...args: unknown[]) => stmt.run(...args),
       get: (...args: unknown[]) => {
@@ -105,6 +143,10 @@ export class BunSQLiteAdapter {
   }
 
   close(): void {
+    for (const ref of this.#stmts) {
+      try { ref.deref()?.finalize?.(); } catch { /* already finalized */ }
+    }
+    this.#stmts.clear();
     this.#raw.close();
   }
 }
@@ -258,10 +300,15 @@ export function loadDatabase(): typeof DatabaseConstructor {
       // Array.join() prevents esbuild from resolving the specifier at bundle time.
       const BunDB = require(["bun", "sqlite"].join(":")).Database;
       _Database = function BunDatabaseFactory(path: string, opts?: any) {
-        const raw = new BunDB(path, {
-          readonly: opts?.readonly,
-          create: true,
-        });
+        // `create` is only valid for read-write opens. Bun <= 1.4.3 turns
+        // `{ readonly: true, create: true }` into a READ-WRITE open and
+        // Bun >= 1.4.4 throws on it (oven-sh/bun#41815). A readonly open of a
+        // missing file therefore throws, as better-sqlite3's `fileMustExist`
+        // callers expect, instead of creating an empty DB.
+        const raw = new BunDB(
+          path,
+          opts?.readonly ? { readonly: true } : { create: true },
+        );
         const adapter = new BunSQLiteAdapter(raw);
         // Propagate busy_timeout — better-sqlite3 does this via constructor
         // option but bun:sqlite does not, so we set it via pragma (#243)

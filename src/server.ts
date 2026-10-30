@@ -1043,11 +1043,14 @@ function persistStats(): void {
     // Lifetime savings — cached separately because getLifetimeStats() scans
     // disk (per-project SessionDBs + auto-memory dirs) and is too expensive
     // for the 500ms persist throttle. Refresh every 30s; the statusline
-    // doesn't need second-by-second lifetime accuracy.
+    // doesn't need second-by-second lifetime accuracy. boundedScan opens only
+    // SessionDBs that changed since the persisted lifetime rollup and serves
+    // the rest from it, so a store of tens of thousands of DBs is not
+    // re-opened every refresh.
     let lifetimeTokens = _lifetimeCache?.tokens ?? 0;
     if (!_lifetimeCache || now - _lifetimeCache.computedAt > LIFETIME_REFRESH_MS) {
       try {
-        const life = getLifetimeStats({ sessionsDir: getSessionDir() });
+        const life = getLifetimeStats({ sessionsDir: getSessionDir(), boundedScan: true });
         lifetimeTokens = (life?.totalEvents ?? 0) * TOKENS_PER_EVENT;
         _lifetimeCache = { tokens: lifetimeTokens, computedAt: now };
       } catch {
