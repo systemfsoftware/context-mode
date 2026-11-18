@@ -6,7 +6,9 @@
 import type { HookOutput } from "../core/contracts/types.ts";
 import { AGENT_IDS, type AgentId } from "../core/contracts/agents.ts";
 import { AGENT_ARG } from "../core/contracts/constants.ts";
-import { failureOutput, handleHook, logHookError, readStdin, writeOut } from "../core/hooks/dispatch.ts";
+import { DETACHED_JOBS_ARG, deferDetachedTo, type DetachedJob, failureOutput, handleHook, logHookError, readStdin, drainDetached, spawnDetached, writeOut } from "../core/hooks/dispatch.ts";
+
+const jobs: DetachedJob[] = [];
 
 const EMPTY: HookOutput = { stdout: "", exitCode: 0 };
 
@@ -14,12 +16,13 @@ function isAgentId(s: string): s is AgentId {
   return (AGENT_IDS as readonly string[]).includes(s);
 }
 
-// D-M3-H2-8: no process.exit. The answer goes out first; the process then ends when the event loop is
-// empty, so a detached journal or index write (dispatch §4.4, §4.6) lands instead of being cut off.
+// D-M3-H2-8: no process.exit. The answer goes out first; the detached journal and index writes (dispatch §4.4,
+// §4.6) then go to a detached child, so the host never waits on another writer's database lock.
 function finish(out: HookOutput): void {
   process.exitCode = out.exitCode;
   if (out.stdout !== "") writeOut(out.stdout);
   if (out.stderr !== undefined && out.stderr !== "") process.stderr.write(out.stderr + "\n"); // kiro deny (D-HF-KIRO-SHELL-1)
+  if (jobs.length > 0) spawnDetached(jobs.splice(0), process.argv[1]!);
 }
 
 /** The failure path: log with the stack, then the host-shaped decision. If even this cannot load, allow (never an exit != 0). */
@@ -34,6 +37,8 @@ function failed(agent: AgentId, raw: unknown, stage: string, err: unknown, env: 
 }
 
 export async function main(argv: string[], env: NodeJS.ProcessEnv): Promise<void> {
+  if (argv[0] === DETACHED_JOBS_ARG) return drainDetached(argv[1] ?? "");
+  deferDetachedTo((job) => jobs.push(job));
   // Step 1: --agent <id>; unknown -> allow (no host shape to answer in).
   const i = argv.indexOf(AGENT_ARG);
   const agent = i >= 0 ? argv[i + 1] ?? "" : "";

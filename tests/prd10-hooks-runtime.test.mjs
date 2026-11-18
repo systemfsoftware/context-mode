@@ -9,7 +9,6 @@ import { tmpdir } from "node:os";
 import path, { dirname, join, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { handleHook } from "../src/core/hooks/dispatch.ts";
-import { ctxSearch } from "../src/core/tools/search.ts";
 import { ctxStats } from "../src/core/tools/stats.ts";
 import { chunkText } from "../src/core/index/chunk.ts";
 import { getAdapter, ADAPTERS, hasRecall, hasReplace } from "../src/adapters/table.ts";
@@ -29,6 +28,7 @@ import { READ_DENY_MESSAGE } from "../src/core/policy/read-deny.ts";
 import { pathToFileURL } from "node:url";
 import { shouldHint } from "../src/core/hooks/throttle.ts";
 import { renderState } from "../src/core/compaction/render.ts";
+import { ctxSearch } from "../src/core/tools/search.ts";
 
 // serial: sets process.env.HOME in before(); process.env is shared by every test in the file
 describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () => {
@@ -168,6 +168,72 @@ describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () =
     assert.deepEqual(out, { stdout: "", exitCode: 0 });
     const rows = await waitRows("SELECT kind, body, ok FROM events WHERE session_id = ?", [p.session_id], 1);
     assert.deepEqual(rows.map((r) => ({ ...r })), [{ kind: "prompt", body: "find the bug", ok: 1 }]);
+  });
+
+  test("hook entry: UserPromptSubmit exits while another writer holds the lock; the prompt row lands after it lets go", async () => {
+    await handleHook("claude-code", cc({ hook_event_name: "UserPromptSubmit", prompt: "make the db" }), env);
+    await waitRows("SELECT 1 FROM events", [], 1);
+    const holder = new DatabaseSync(dbFile());
+    holder.exec("BEGIN IMMEDIATE");
+    const p = cc({ hook_event_name: "UserPromptSubmit", prompt: "while locked" });
+    let ms;
+    try {
+      const start = Date.now();
+      const run = spawnSync(process.execPath, [join(import.meta.dirname, "..", "src", "entries", "hook.ts"), "--agent", "claude-code"],
+        { input: JSON.stringify(p), env, encoding: "utf8", timeout: 20000 });
+      ms = Date.now() - start;
+      assert.equal(run.status, 0, run.stderr);
+      assert.deepEqual(query("SELECT 1 FROM events WHERE session_id = ?", p.session_id), []);
+    } finally {
+      holder.exec("ROLLBACK");
+      holder.close();
+    }
+    assert.ok(ms < 2000, "the hook waited " + ms + " ms on the lock");
+    const rows = await waitRows("SELECT kind, body FROM events WHERE session_id = ?", [p.session_id], 1);
+    assert.deepEqual(rows.map((r) => ({ ...r })), [{ kind: "prompt", body: "while locked" }]);
+  });
+
+  test("hook entry: detached writes queued behind a held lock land in the order the hooks ran", async () => {
+    await handleHook("claude-code", cc({ hook_event_name: "UserPromptSubmit", prompt: "make the db" }), env);
+    await waitRows("SELECT 1 FROM events", [], 1);
+    const sid = "order-" + Math.random().toString(36).slice(2);
+    const holder = new DatabaseSync(dbFile());
+    holder.exec("BEGIN IMMEDIATE");
+    try {
+      for (let i = 0; i < 5; i++) {
+        const p = { session_id: sid, cwd: repo, hook_event_name: "UserPromptSubmit", prompt: "p" + i };
+        const run = spawnSync(process.execPath, [join(import.meta.dirname, "..", "src", "entries", "hook.ts"), "--agent", "claude-code"],
+          { input: JSON.stringify(p), env, encoding: "utf8", timeout: 20000 });
+        assert.equal(run.status, 0, run.stderr);
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    } finally {
+      holder.exec("ROLLBACK");
+      holder.close();
+    }
+    const end = Date.now() + 20000;
+    let rows = [];
+    while (Date.now() < end) {
+      rows = query("SELECT body FROM events WHERE session_id = ? ORDER BY seq", sid);
+      if (rows.length >= 5) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.deepEqual(rows.map((r) => r.body), ["p0", "p1", "p2", "p3", "p4"]);
+  });
+
+  test("hook entry: a ctx_search right after a large PostToolUse finds the output the detached child indexes", async () => {
+    const lines = [];
+    for (let i = 0; i < 40000; i++) lines.push("line " + i + " alpha beta gamma delta epsilon zeta eta theta");
+    lines.push("the needle is quokkazebra at the end");
+    const p = cc({ hook_event_name: "PostToolUse", tool_name: "Bash", tool_use_id: "toolu_big", tool_input: { command: "cat big.log" },
+      tool_response: { stdout: lines.join("\n"), stderr: "", interrupted: false } });
+    const run = spawnSync(process.execPath, [join(import.meta.dirname, "..", "src", "entries", "hook.ts"), "--agent", "claude-code"],
+      { input: JSON.stringify(p), env, encoding: "utf8", timeout: 20000 });
+    assert.equal(run.status, 0, run.stderr);
+    const project = resolveProject("claude-code", { env, argv: [], cwd: repo });
+    const out = await ctxSearch.handler({ queries: ["quokkazebra"] }, { project, sessionId: p.session_id, turn: 1, signal: new AbortController().signal });
+    assert.equal(out.isError, false);
+    assert.ok(out.text.includes("quokkazebra"), out.text);
   });
 
   test("PreCompact (vscode, pending-flag): sets the pending_compact meta key", async () => {
@@ -1859,24 +1925,43 @@ describe("PRD-v2 section 10: hook entry argv and stdin handling (GP7)", () => {
     assert.equal(none.stdout, "");
   });
 
-  test("detached journal write lands before the process ends (D-M3-H2-8)", () => {
+  async function eventually(read, done) {
+    const end = Date.now() + 5000;
+    for (;;) {
+      let v;
+      try {
+        v = read();
+      } catch (err) {
+        if (err.code !== "ERR_SQLITE_ERROR" || Date.now() > end) throw err;
+        await new Promise((r) => setTimeout(r, 20));
+        continue;
+      }
+      if (done(v) || Date.now() > end) return v;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
+
+  test("detached journal write lands from the detached child after the hook exits (D-M3-H2-8)", async () => {
     const p = { session_id: "e2", cwd: repo, hook_event_name: "UserPromptSubmit", prompt: "hello entry" };
     const r = run(["--agent", "claude-code"], JSON.stringify(p));
     assert.equal(r.status, 0);
     assert.equal(r.stdout, "");
     const projects = join(root, ".context-mode", "projects");
-    const db = join(projects, readdirSync(projects)[0], "context.db");
-    assert.ok(existsSync(db));
-    const h = new DatabaseSync(db, { readOnly: true });
-    try {
-      const rows = h.prepare("SELECT kind, body FROM events WHERE session_id = ?").all("e2");
-      assert.deepEqual(rows.map((x) => ({ ...x })), [{ kind: "prompt", body: "hello entry" }]);
-    } finally {
-      h.close();
-    }
+    const rows = await eventually(() => {
+      if (!existsSync(projects) || readdirSync(projects).length === 0) return [];
+      const db = join(projects, readdirSync(projects)[0], "context.db");
+      if (!existsSync(db)) return [];
+      const h = new DatabaseSync(db, { readOnly: true });
+      try {
+        return h.prepare("SELECT kind, body FROM events WHERE session_id = ?").all("e2").map((x) => ({ ...x }));
+      } finally {
+        h.close();
+      }
+    }, (v) => v.length > 0);
+    assert.deepEqual(rows, [{ kind: "prompt", body: "hello entry" }]);
   });
 
-  test("GP7/codex-session-project-dir: codex sessions in X and Y write to their own project", () => {
+  test("GP7/codex-session-project-dir: codex sessions in X and Y write to their own project", async () => {
     const x = join(root, "x");
     const y = join(root, "y");
     for (const d of [x, y]) { mkdirSync(d); execFileSync("git", ["init", "-q", d]); }
@@ -1887,15 +1972,20 @@ describe("PRD-v2 section 10: hook entry argv and stdin handling (GP7)", () => {
       assert.equal(r.status, 0);
     }
     const projects = join(root, ".context-mode", "projects");
-    const seen = {};
-    for (const k of readdirSync(projects)) {
-      const h = new DatabaseSync(join(projects, k, "context.db"), { readOnly: true });
-      try {
-        for (const r of h.prepare("SELECT session_id, worktree FROM events WHERE session_id LIKE 'cx-%'").all()) seen[r.session_id] = r.worktree;
-      } finally {
-        h.close();
+    const seen = await eventually(() => {
+      const found = {};
+      for (const k of readdirSync(projects)) {
+        const f = join(projects, k, "context.db");
+        if (!existsSync(f)) continue;
+        const h = new DatabaseSync(f, { readOnly: true, timeout: 5000 });
+        try {
+          for (const r of h.prepare("SELECT session_id, worktree FROM events WHERE session_id LIKE 'cx-%'").all()) found[r.session_id] = r.worktree;
+        } finally {
+          h.close();
+        }
       }
-    }
+      return found;
+    }, (v) => "cx-a" in v && "cx-b" in v);
     assert.equal(seen["cx-a"], realpathSync.native(x));
     assert.equal(seen["cx-b"], realpathSync.native(y));
   });
