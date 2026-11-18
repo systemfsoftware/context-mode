@@ -110,8 +110,11 @@ export function spawnDetached(batch: DetachedJob[], entry: string): void {
   try {
     const dir = batch[0]!.project.projectDir;
     fs.mkdirSync(dir, { recursive: true });
-    const name = JOB_FILE_PREFIX + String(Date.now()).padStart(15, "0") + "-" + process.pid + "-" + randomBytes(6).toString("hex") + JOB_FILE_SUFFIX;
-    fs.writeFileSync(path.join(dir, name), JSON.stringify(batch), { mode: 0o600 });
+    const id = process.pid + "-" + randomBytes(6).toString("hex");
+    const name = JOB_FILE_PREFIX + String(Date.now()).padStart(15, "0") + "-" + id + JOB_FILE_SUFFIX;
+    const tmp = path.join(dir, ".tmp-" + id);
+    fs.writeFileSync(tmp, JSON.stringify(batch), { mode: 0o600 });
+    fs.renameSync(tmp, path.join(dir, name));
     const child = spawn(process.execPath, [entry, DETACHED_JOBS_ARG, dir], { detached: true, stdio: "ignore", windowsHide: true });
     child.on("error", fail);
     child.unref();
