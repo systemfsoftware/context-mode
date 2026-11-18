@@ -35,7 +35,7 @@ import { chunkText } from "../index/chunk.ts";
 import { moreLine, selectChunksInMemory } from "../index/select.ts";
 import { shapeDigest } from "../index/shape.ts";
 import { indexText } from "../index/text.ts";
-import { appendDetached, detach, writeJournal, type DetachedJob } from "./detached.ts";
+import { appendDetached, detach, pendingJobFiles, releaseDrainLock, takeDrainLock, touchDrainLock, writeJournal, type DetachedJob } from "./detached.ts";
 import { askedWords } from "./handle-query.ts";
 import { answerDecisions, askOptionLabels, optionEchoDecision, type DecisionPart } from "./decision.ts";
 import { shouldHint } from "./throttle.ts";
@@ -767,12 +767,26 @@ export async function runDetachedJob(job: DetachedJob): Promise<void> {
   }
 }
 
-export async function runDetachedFile(file: string): Promise<void> {
-  const { readFileSync, unlinkSync } = process.getBuiltinModule("node:fs") as typeof import("node:fs");
-  try {
-    const batch = JSON.parse(readFileSync(file, "utf8")) as DetachedJob[];
-    for (const job of batch) await runDetachedJob(job);
-  } finally {
-    unlinkSync(file);
+export async function drainDetached(projectDir: string): Promise<void> {
+  const { readFileSync, rmSync } = process.getBuiltinModule("node:fs") as typeof import("node:fs");
+  while (pendingJobFiles(projectDir).length > 0) {
+    if (!takeDrainLock(projectDir)) return;
+    try {
+      for (let files = pendingJobFiles(projectDir); files.length > 0; files = pendingJobFiles(projectDir)) {
+        for (const file of files) {
+          try {
+            const batch = JSON.parse(readFileSync(file, "utf8")) as DetachedJob[];
+            for (const job of batch) await runDetachedJob(job);
+          } catch (err) {
+            process.stderr.write("hooks: detached job file failed: " + message(err) + "\n");
+          } finally {
+            rmSync(file, { force: true });
+          }
+          touchDrainLock(projectDir);
+        }
+      }
+    } finally {
+      releaseDrainLock(projectDir);
+    }
   }
 }

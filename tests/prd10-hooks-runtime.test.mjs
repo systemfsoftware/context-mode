@@ -193,6 +193,34 @@ describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () =
     assert.deepEqual(rows.map((r) => ({ ...r })), [{ kind: "prompt", body: "while locked" }]);
   });
 
+  test("hook entry: detached writes queued behind a held lock land in the order the hooks ran", async () => {
+    await handleHook("claude-code", cc({ hook_event_name: "UserPromptSubmit", prompt: "make the db" }), env);
+    await waitRows("SELECT 1 FROM events", [], 1);
+    const sid = "order-" + Math.random().toString(36).slice(2);
+    const holder = new DatabaseSync(dbFile());
+    holder.exec("BEGIN IMMEDIATE");
+    try {
+      for (let i = 0; i < 5; i++) {
+        const p = { session_id: sid, cwd: repo, hook_event_name: "UserPromptSubmit", prompt: "p" + i };
+        const run = spawnSync(process.execPath, [join(import.meta.dirname, "..", "src", "entries", "hook.ts"), "--agent", "claude-code"],
+          { input: JSON.stringify(p), env, encoding: "utf8", timeout: 20000 });
+        assert.equal(run.status, 0, run.stderr);
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    } finally {
+      holder.exec("ROLLBACK");
+      holder.close();
+    }
+    const end = Date.now() + 20000;
+    let rows = [];
+    while (Date.now() < end) {
+      rows = query("SELECT body FROM events WHERE session_id = ? ORDER BY seq", sid);
+      if (rows.length >= 5) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.deepEqual(rows.map((r) => r.body), ["p0", "p1", "p2", "p3", "p4"]);
+  });
+
   test("hook entry: a ctx_search right after a large PostToolUse finds the output the detached child indexes", async () => {
     const lines = [];
     for (let i = 0; i < 40000; i++) lines.push("line " + i + " alpha beta gamma delta epsilon zeta eta theta");

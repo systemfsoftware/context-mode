@@ -6,7 +6,7 @@
 import type { HookOutput } from "../core/contracts/types.ts";
 import { AGENT_IDS, type AgentId } from "../core/contracts/agents.ts";
 import { AGENT_ARG } from "../core/contracts/constants.ts";
-import { DETACHED_JOBS_ARG, deferDetachedTo, type DetachedJob, failureOutput, handleHook, logHookError, readStdin, runDetachedFile, spawnDetached, writeOut } from "../core/hooks/dispatch.ts";
+import { DETACHED_JOBS_ARG, deferDetachedTo, type DetachedJob, failureOutput, handleHook, logHookError, readStdin, drainDetached, spawnDetached, writeOut } from "../core/hooks/dispatch.ts";
 
 const jobs: DetachedJob[] = [];
 
@@ -37,7 +37,7 @@ function failed(agent: AgentId, raw: unknown, stage: string, err: unknown, env: 
 }
 
 export async function main(argv: string[], env: NodeJS.ProcessEnv): Promise<void> {
-  if (argv[0] === DETACHED_JOBS_ARG) return runDetachedFile(argv[1] ?? "");
+  if (argv[0] === DETACHED_JOBS_ARG) return drainDetached(argv[1] ?? "");
   deferDetachedTo((job) => jobs.push(job));
   // Step 1: --agent <id>; unknown -> allow (no host shape to answer in).
   const i = argv.indexOf(AGENT_ARG);
