@@ -769,7 +769,10 @@ export async function runDetachedJob(job: DetachedJob): Promise<void> {
 
 export async function runDetachedFile(file: string): Promise<void> {
   const { readFileSync, unlinkSync } = process.getBuiltinModule("node:fs") as typeof import("node:fs");
-  const batch = JSON.parse(readFileSync(file, "utf8")) as DetachedJob[];
-  unlinkSync(file);
-  for (const job of batch) await runDetachedJob(job);
+  try {
+    const batch = JSON.parse(readFileSync(file, "utf8")) as DetachedJob[];
+    for (const job of batch) await runDetachedJob(job);
+  } finally {
+    unlinkSync(file);
+  }
 }

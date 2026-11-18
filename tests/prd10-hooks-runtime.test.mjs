@@ -9,7 +9,6 @@ import { tmpdir } from "node:os";
 import path, { dirname, join, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { handleHook } from "../src/core/hooks/dispatch.ts";
-import { ctxSearch } from "../src/core/tools/search.ts";
 import { ctxStats } from "../src/core/tools/stats.ts";
 import { chunkText } from "../src/core/index/chunk.ts";
 import { getAdapter, ADAPTERS, hasRecall, hasReplace } from "../src/adapters/table.ts";
@@ -29,6 +28,7 @@ import { READ_DENY_MESSAGE } from "../src/core/policy/read-deny.ts";
 import { pathToFileURL } from "node:url";
 import { shouldHint } from "../src/core/hooks/throttle.ts";
 import { renderState } from "../src/core/compaction/render.ts";
+import { ctxSearch } from "../src/core/tools/search.ts";
 
 // serial: sets process.env.HOME in before(); process.env is shared by every test in the file
 describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () => {
@@ -191,6 +191,21 @@ describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () =
     assert.ok(ms < 2000, "the hook waited " + ms + " ms on the lock");
     const rows = await waitRows("SELECT kind, body FROM events WHERE session_id = ?", [p.session_id], 1);
     assert.deepEqual(rows.map((r) => ({ ...r })), [{ kind: "prompt", body: "while locked" }]);
+  });
+
+  test("hook entry: a ctx_search right after a large PostToolUse finds the output the detached child indexes", async () => {
+    const lines = [];
+    for (let i = 0; i < 40000; i++) lines.push("line " + i + " alpha beta gamma delta epsilon zeta eta theta");
+    lines.push("the needle is quokkazebra at the end");
+    const p = cc({ hook_event_name: "PostToolUse", tool_name: "Bash", tool_use_id: "toolu_big", tool_input: { command: "cat big.log" },
+      tool_response: { stdout: lines.join("\n"), stderr: "", interrupted: false } });
+    const run = spawnSync(process.execPath, [join(import.meta.dirname, "..", "src", "entries", "hook.ts"), "--agent", "claude-code"],
+      { input: JSON.stringify(p), env, encoding: "utf8", timeout: 20000 });
+    assert.equal(run.status, 0, run.stderr);
+    const project = resolveProject("claude-code", { env, argv: [], cwd: repo });
+    const out = await ctxSearch.handler({ queries: ["quokkazebra"] }, { project, sessionId: p.session_id, turn: 1, signal: new AbortController().signal });
+    assert.equal(out.isError, false);
+    assert.ok(out.text.includes("quokkazebra"), out.text);
   });
 
   test("PreCompact (vscode, pending-flag): sets the pending_compact meta key", async () => {
@@ -1885,7 +1900,14 @@ describe("PRD-v2 section 10: hook entry argv and stdin handling (GP7)", () => {
   async function eventually(read, done) {
     const end = Date.now() + 5000;
     for (;;) {
-      const v = read();
+      let v;
+      try {
+        v = read();
+      } catch (err) {
+        if (err.code !== "ERR_SQLITE_ERROR" || Date.now() > end) throw err;
+        await new Promise((r) => setTimeout(r, 20));
+        continue;
+      }
       if (done(v) || Date.now() > end) return v;
       await new Promise((r) => setTimeout(r, 20));
     }
@@ -1927,7 +1949,7 @@ describe("PRD-v2 section 10: hook entry argv and stdin handling (GP7)", () => {
       for (const k of readdirSync(projects)) {
         const f = join(projects, k, "context.db");
         if (!existsSync(f)) continue;
-        const h = new DatabaseSync(f, { readOnly: true });
+        const h = new DatabaseSync(f, { readOnly: true, timeout: 5000 });
         try {
           for (const r of h.prepare("SELECT session_id, worktree FROM events WHERE session_id LIKE 'cx-%'").all()) found[r.session_id] = r.worktree;
         } finally {

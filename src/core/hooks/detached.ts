@@ -22,6 +22,34 @@ export function detach(job: DetachedJob, inProcess: () => Promise<void>): void {
 }
 
 export const DETACHED_JOBS_ARG = "--detached-jobs";
+const JOB_FILE_PREFIX = "detached-";
+const JOB_FILE_SUFFIX = ".json";
+const SETTLE_POLL_MS = 50;
+const SETTLE_MAX_MS = 15000;
+const JOB_FILE_STALE_MS = 120000;
+
+export async function detachedSettled(project: ProjectContext): Promise<void> {
+  const { readdirSync, statSync } = process.getBuiltinModule("node:fs") as typeof import("node:fs");
+  const { join } = process.getBuiltinModule("node:path") as typeof import("node:path");
+  const end = Date.now() + SETTLE_MAX_MS;
+  for (;;) {
+    let pending = false;
+    try {
+      for (const n of readdirSync(project.projectDir)) {
+        if (!n.startsWith(JOB_FILE_PREFIX) || !n.endsWith(JOB_FILE_SUFFIX)) continue;
+        try {
+          if (Date.now() - statSync(join(project.projectDir, n)).mtimeMs < JOB_FILE_STALE_MS) pending = true;
+        } catch {
+          continue;
+        }
+      }
+    } catch {
+      return;
+    }
+    if (!pending || Date.now() > end) return;
+    await new Promise((r) => setTimeout(r, SETTLE_POLL_MS));
+  }
+}
 
 export function spawnDetached(batch: DetachedJob[], entry: string): void {
   const { spawn } = process.getBuiltinModule("node:child_process") as typeof import("node:child_process");
@@ -29,7 +57,7 @@ export function spawnDetached(batch: DetachedJob[], entry: string): void {
   const { randomBytes } = process.getBuiltinModule("node:crypto") as typeof import("node:crypto");
   const { join } = process.getBuiltinModule("node:path") as typeof import("node:path");
   try {
-    const file = join(batch[0]!.project.projectDir, "detached-" + process.pid + "-" + randomBytes(6).toString("hex") + ".json");
+    const file = join(batch[0]!.project.projectDir, JOB_FILE_PREFIX + process.pid + "-" + randomBytes(6).toString("hex") + JOB_FILE_SUFFIX);
     writeFileSync(file, JSON.stringify(batch), { mode: 0o600 });
     spawn(process.execPath, [entry, DETACHED_JOBS_ARG, file], { detached: true, stdio: "ignore", windowsHide: true }).unref();
   } catch (err) {

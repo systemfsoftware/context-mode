@@ -8,6 +8,7 @@ import { formatError } from "../contracts/errors.ts";
 import type { CtxSearchInput, DbHandle, Hit, SearchScope, TimelineRow, ToolContext, ToolReply } from "../contracts/types.ts";
 import { capBytes } from "../sandbox/cap.ts";
 import { closeDb, openDb } from "../store/db.ts";
+import { detachedSettled } from "../hooks/detached.ts";
 import { collisionLine, ftsListSource, ftsQuery, ftsQueryTimeline, groupDigits, isLongLabel, labelPage, pickSource, rankTexts, shownLabel, sourceCardRow, sourceHandle, type SourcePick } from "../store/fts.ts";
 import { memoryChunks, memoryFileNamed, memoryHits, readAutoMemory } from "../index/auto-memory.ts";
 import { fitRow, jsonRows, namedKeys } from "../index/shape.ts";
@@ -424,6 +425,7 @@ async function handler(input: CtxSearchInput, ctx: ToolContext): Promise<ToolRep
     input = rest;
   }
   const scope: SearchScope = input.scope ?? "worktree";
+  await detachedSettled(ctx.project);
   const db = await openDb(ctx.project, { readOnly: true });
   try {
     // D-LABEL-HANDLE-1: a stored label wins, then a short id, then a label without its "#" suffix (pickSource).
