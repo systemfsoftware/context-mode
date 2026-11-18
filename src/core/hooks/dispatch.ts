@@ -35,7 +35,7 @@ import { chunkText } from "../index/chunk.ts";
 import { moreLine, selectChunksInMemory } from "../index/select.ts";
 import { shapeDigest } from "../index/shape.ts";
 import { indexText } from "../index/text.ts";
-import { appendDetached } from "./detached.ts";
+import { appendDetached, detach, writeJournal, type DetachedJob } from "./detached.ts";
 import { askedWords } from "./handle-query.ts";
 import { answerDecisions, askOptionLabels, optionEchoDecision, type DecisionPart } from "./decision.ts";
 import { shouldHint } from "./throttle.ts";
@@ -43,7 +43,8 @@ import { CtxError } from "../contracts/errors.ts";
 import { allowOutput, failureOutput, fault, logHookError, nodeTooOld } from "./fallback.ts";
 
 export { failureOutput, logHookError } from "./fallback.ts"; // D-HNE-GUARD-1: the entry's last-resort catch
-export { readStdin, writeOut } from "./io.ts"; // D-M7-HP-1: entry I/O without process.stdin/stdout streams
+export { readStdin, writeOut } from "./io.ts";
+export { deferDetachedTo, type DetachedJob } from "./detached.ts"; // D-M7-HP-1: entry I/O without process.stdin/stdout streams
 
 const ALLOW: Decision = { kind: "allow" };
 const EMPTY: HookOutput = { stdout: "", exitCode: 0 };
@@ -310,8 +311,12 @@ function readOptions(value: string): PendingOptions | null {
 // this prompt only (taken, then gone). The metaGet check keeps a prompt with nothing offered write-free.
 function echoDetached(ev: CanonicalHookEvent, project: ProjectContext, prompt: string): void {
   if (ev.sessionId === "") return;
+  detach({ kind: "echo", ev, project, prompt }, () => echoWrite(ev, project, prompt));
+}
+
+function echoWrite(ev: CanonicalHookEvent, project: ProjectContext, prompt: string): Promise<void> {
   const key = optionsKey(ev.sessionId);
-  void openDb(project)
+  return openDb(project)
     .then((db) => {
       if (metaGet(db, key) === null) return;
       const taken = metaTake(db, key);
@@ -343,7 +348,11 @@ function askDetached(ev: CanonicalHookEvent, project: ProjectContext, tool: Tool
   const parts = answerDecisions(text);
   const labels = parts.length === 0 ? askOptionLabels(tool.input) : [];
   if (parts.length === 0 && labels.length === 0) return;
-  void openDb(project)
+  detach({ kind: "ask", ev, project, tool, text }, () => askWrite(ev, project, parts, labels));
+}
+
+function askWrite(ev: CanonicalHookEvent, project: ProjectContext, parts: DecisionPart[], labels: string[]): Promise<void> {
+  return openDb(project)
     .then((db) => {
       if (parts.length > 0) return writeDecisions(db, ev, project, parts);
       const prompts = readSessionEvents(db, ev.sessionId, "prompt");
@@ -701,7 +710,11 @@ function mainLabel(tool: ToolCall, ev: CanonicalHookEvent): string {
 // F1: above SYNC_INDEX_MAX_BYTES the FTS5 chunk write never blocks the decision; same rules as appendDetached.
 // The source row is already reserved (D-CR3-HANDLE-2); chunks and line units land under its id.
 function indexDetached(project: ProjectContext, sessionId: string, sourceId: number, label: string, text: string, chunks: Chunk[]): void {
-  void openDb(project)
+  detach({ kind: "index", project, sessionId, sourceId, label, text, chunks }, () => indexWrite(project, sessionId, sourceId, label, text, chunks));
+}
+
+function indexWrite(project: ProjectContext, sessionId: string, sourceId: number, label: string, text: string, chunks: Chunk[]): Promise<void> {
+  return openDb(project)
     .then((db) => {
       finishReserved(db, sourceId, sourceRowOf(project, sessionId, label), chunks, buildUnits(text)); // r3-ledger, D-R4-RESERVE-1
     })
@@ -737,4 +750,19 @@ function usage(ev: CanonicalHookEvent, project: ProjectContext): Promise<Decisio
     path: null, ok: 1, exit_code: null, bytes: 0, body: "", turn: ev.turn ?? 0, sandbox_bytes: 0, returned_bytes: 0,
   });
   return Promise.resolve(ALLOW);
+}
+
+export async function runDetachedJob(job: DetachedJob): Promise<void> {
+  switch (job.kind) {
+    case "append":
+      return writeJournal(job.project, job.row);
+    case "index":
+      return indexWrite(job.project, job.sessionId, job.sourceId, job.label, job.text, job.chunks);
+    case "echo":
+      return echoWrite(job.ev, job.project, job.prompt);
+    case "ask": {
+      const parts = answerDecisions(job.text);
+      return askWrite(job.ev, job.project, parts, parts.length === 0 ? askOptionLabels(job.tool.input) : []);
+    }
+  }
 }

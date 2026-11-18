@@ -170,6 +170,29 @@ describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () =
     assert.deepEqual(rows.map((r) => ({ ...r })), [{ kind: "prompt", body: "find the bug", ok: 1 }]);
   });
 
+  test("hook entry: UserPromptSubmit exits while another writer holds the lock; the prompt row lands after it lets go", async () => {
+    await handleHook("claude-code", cc({ hook_event_name: "UserPromptSubmit", prompt: "make the db" }), env);
+    await waitRows("SELECT 1 FROM events", [], 1);
+    const holder = new DatabaseSync(dbFile());
+    holder.exec("BEGIN IMMEDIATE");
+    const p = cc({ hook_event_name: "UserPromptSubmit", prompt: "while locked" });
+    let ms;
+    try {
+      const start = Date.now();
+      const run = spawnSync(process.execPath, [join(import.meta.dirname, "..", "src", "entries", "hook.ts"), "--agent", "claude-code"],
+        { input: JSON.stringify(p), env, encoding: "utf8", timeout: 20000 });
+      ms = Date.now() - start;
+      assert.equal(run.status, 0, run.stderr);
+      assert.deepEqual(query("SELECT 1 FROM events WHERE session_id = ?", p.session_id), []);
+    } finally {
+      holder.exec("ROLLBACK");
+      holder.close();
+    }
+    assert.ok(ms < 2000, "the hook waited " + ms + " ms on the lock");
+    const rows = await waitRows("SELECT kind, body FROM events WHERE session_id = ?", [p.session_id], 1);
+    assert.deepEqual(rows.map((r) => ({ ...r })), [{ kind: "prompt", body: "while locked" }]);
+  });
+
   test("PreCompact (vscode, pending-flag): sets the pending_compact meta key", async () => {
     // D-HF-VSCODE-PROJECT-1: a vscode hook resolves its project from the payload cwd.
     const p = cc({ hook_event_name: "PreCompact" });

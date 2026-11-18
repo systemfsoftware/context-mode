@@ -2,11 +2,28 @@
 // DEVIATIONS D-M3-H1-3.
 import { openDb } from "../store/db.ts";
 import { appendEvent } from "../journal/append.ts";
-import type { NewJournalRow, ProjectContext } from "../contracts/types.ts";
+import type { CanonicalHookEvent, Chunk, NewJournalRow, ProjectContext, ToolCall } from "../contracts/types.ts";
+
+export type DetachedJob =
+  | { kind: "append"; project: ProjectContext; row: NewJournalRow }
+  | { kind: "index"; project: ProjectContext; sessionId: string; sourceId: number; label: string; text: string; chunks: Chunk[] }
+  | { kind: "echo"; ev: CanonicalHookEvent; project: ProjectContext; prompt: string }
+  | { kind: "ask"; ev: CanonicalHookEvent; project: ProjectContext; tool: ToolCall; text: string };
+
+let sink: ((job: DetachedJob) => void) | null = null;
+
+export function deferDetachedTo(fn: (job: DetachedJob) => void): void {
+  sink = fn;
+}
+
+export function detach(job: DetachedJob, inProcess: () => Promise<void>): void {
+  if (sink !== null) sink(job);
+  else void inProcess();
+}
 
 // §3.2 steps 1-2: open and append; every error ends here as one stderr line. No closeDb (A21):
 // the hook process exits right after encode, and a checkpoint would make this write blocking.
-async function write(project: ProjectContext, row: NewJournalRow): Promise<void> {
+export async function writeJournal(project: ProjectContext, row: NewJournalRow): Promise<void> {
   try {
     const db = await openDb(project);
     appendEvent(db, row);
@@ -22,5 +39,5 @@ async function write(project: ProjectContext, row: NewJournalRow): Promise<void>
  */
 export function appendDetached(project: ProjectContext, sessionId: string, row: NewJournalRow): void {
   void sessionId;
-  void write(project, row);
+  detach({ kind: "append", project, row }, () => writeJournal(project, row));
 }
