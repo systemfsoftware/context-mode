@@ -1882,24 +1882,36 @@ describe("PRD-v2 section 10: hook entry argv and stdin handling (GP7)", () => {
     assert.equal(none.stdout, "");
   });
 
-  test("detached journal write lands before the process ends (D-M3-H2-8)", () => {
+  async function eventually(read, done) {
+    const end = Date.now() + 5000;
+    for (;;) {
+      const v = read();
+      if (done(v) || Date.now() > end) return v;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
+
+  test("detached journal write lands from the detached child after the hook exits (D-M3-H2-8)", async () => {
     const p = { session_id: "e2", cwd: repo, hook_event_name: "UserPromptSubmit", prompt: "hello entry" };
     const r = run(["--agent", "claude-code"], JSON.stringify(p));
     assert.equal(r.status, 0);
     assert.equal(r.stdout, "");
     const projects = join(root, ".context-mode", "projects");
-    const db = join(projects, readdirSync(projects)[0], "context.db");
-    assert.ok(existsSync(db));
-    const h = new DatabaseSync(db, { readOnly: true });
-    try {
-      const rows = h.prepare("SELECT kind, body FROM events WHERE session_id = ?").all("e2");
-      assert.deepEqual(rows.map((x) => ({ ...x })), [{ kind: "prompt", body: "hello entry" }]);
-    } finally {
-      h.close();
-    }
+    const rows = await eventually(() => {
+      if (!existsSync(projects) || readdirSync(projects).length === 0) return [];
+      const db = join(projects, readdirSync(projects)[0], "context.db");
+      if (!existsSync(db)) return [];
+      const h = new DatabaseSync(db, { readOnly: true });
+      try {
+        return h.prepare("SELECT kind, body FROM events WHERE session_id = ?").all("e2").map((x) => ({ ...x }));
+      } finally {
+        h.close();
+      }
+    }, (v) => v.length > 0);
+    assert.deepEqual(rows, [{ kind: "prompt", body: "hello entry" }]);
   });
 
-  test("GP7/codex-session-project-dir: codex sessions in X and Y write to their own project", () => {
+  test("GP7/codex-session-project-dir: codex sessions in X and Y write to their own project", async () => {
     const x = join(root, "x");
     const y = join(root, "y");
     for (const d of [x, y]) { mkdirSync(d); execFileSync("git", ["init", "-q", d]); }
@@ -1910,15 +1922,20 @@ describe("PRD-v2 section 10: hook entry argv and stdin handling (GP7)", () => {
       assert.equal(r.status, 0);
     }
     const projects = join(root, ".context-mode", "projects");
-    const seen = {};
-    for (const k of readdirSync(projects)) {
-      const h = new DatabaseSync(join(projects, k, "context.db"), { readOnly: true });
-      try {
-        for (const r of h.prepare("SELECT session_id, worktree FROM events WHERE session_id LIKE 'cx-%'").all()) seen[r.session_id] = r.worktree;
-      } finally {
-        h.close();
+    const seen = await eventually(() => {
+      const found = {};
+      for (const k of readdirSync(projects)) {
+        const f = join(projects, k, "context.db");
+        if (!existsSync(f)) continue;
+        const h = new DatabaseSync(f, { readOnly: true });
+        try {
+          for (const r of h.prepare("SELECT session_id, worktree FROM events WHERE session_id LIKE 'cx-%'").all()) found[r.session_id] = r.worktree;
+        } finally {
+          h.close();
+        }
       }
-    }
+      return found;
+    }, (v) => "cx-a" in v && "cx-b" in v);
     assert.equal(seen["cx-a"], realpathSync.native(x));
     assert.equal(seen["cx-b"], realpathSync.native(y));
   });

@@ -21,6 +21,22 @@ export function detach(job: DetachedJob, inProcess: () => Promise<void>): void {
   else void inProcess();
 }
 
+export const DETACHED_JOBS_ARG = "--detached-jobs";
+
+export function spawnDetached(batch: DetachedJob[], entry: string): void {
+  const { spawn } = process.getBuiltinModule("node:child_process") as typeof import("node:child_process");
+  const { writeFileSync } = process.getBuiltinModule("node:fs") as typeof import("node:fs");
+  const { randomBytes } = process.getBuiltinModule("node:crypto") as typeof import("node:crypto");
+  const { join } = process.getBuiltinModule("node:path") as typeof import("node:path");
+  try {
+    const file = join(batch[0]!.project.projectDir, "detached-" + process.pid + "-" + randomBytes(6).toString("hex") + ".json");
+    writeFileSync(file, JSON.stringify(batch), { mode: 0o600 });
+    spawn(process.execPath, [entry, DETACHED_JOBS_ARG, file], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+  } catch (err) {
+    process.stderr.write("hooks: detached write failed: " + (err instanceof Error ? err.message : String(err)) + "\n");
+  }
+}
+
 // §3.2 steps 1-2: open and append; every error ends here as one stderr line. No closeDb (A21):
 // the hook process exits right after encode, and a checkpoint would make this write blocking.
 export async function writeJournal(project: ProjectContext, row: NewJournalRow): Promise<void> {

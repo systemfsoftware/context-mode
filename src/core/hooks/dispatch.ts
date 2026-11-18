@@ -44,7 +44,7 @@ import { allowOutput, failureOutput, fault, logHookError, nodeTooOld } from "./f
 
 export { failureOutput, logHookError } from "./fallback.ts"; // D-HNE-GUARD-1: the entry's last-resort catch
 export { readStdin, writeOut } from "./io.ts";
-export { deferDetachedTo, type DetachedJob } from "./detached.ts"; // D-M7-HP-1: entry I/O without process.stdin/stdout streams
+export { DETACHED_JOBS_ARG, deferDetachedTo, spawnDetached, type DetachedJob } from "./detached.ts"; // D-M7-HP-1: entry I/O without process.stdin/stdout streams
 
 const ALLOW: Decision = { kind: "allow" };
 const EMPTY: HookOutput = { stdout: "", exitCode: 0 };
@@ -765,4 +765,11 @@ export async function runDetachedJob(job: DetachedJob): Promise<void> {
       return askWrite(job.ev, job.project, parts, parts.length === 0 ? askOptionLabels(job.tool.input) : []);
     }
   }
+}
+
+export async function runDetachedFile(file: string): Promise<void> {
+  const { readFileSync, unlinkSync } = process.getBuiltinModule("node:fs") as typeof import("node:fs");
+  const batch = JSON.parse(readFileSync(file, "utf8")) as DetachedJob[];
+  unlinkSync(file);
+  for (const job of batch) await runDetachedJob(job);
 }
