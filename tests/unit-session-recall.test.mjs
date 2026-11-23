@@ -3,15 +3,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { UNIT_MAX_ROWS_PER_SESSION, RECALL_TIMEOUT_LOG } from "../src/core/contracts/constants.ts";
+import { UNIT_MAX_ROWS_PER_SESSION } from "../src/core/contracts/constants.ts";
 import { closeDb, openDb } from "../src/core/store/db.ts";
-import { deleteChunkRows, insertUnits, queryUnits, unitMatch, unitTableName } from "../src/core/store/fts.ts";
+import { deleteChunkRows, insertUnits, queryUnits, unitMatch, unitQuery, unitTableName } from "../src/core/store/fts.ts";
 import { pruneStore } from "../src/core/store/cleanup.ts";
-import { recallUnits } from "../src/core/hooks/recall.ts";
+import { recallBudgetMs, recallSkipReason, recallTierOne } from "../src/core/hooks/recall.ts";
 
 const run = promisify(execFile);
 
@@ -101,31 +101,61 @@ test("deleting a source or a session removes its units and nothing else", async 
   });
 });
 
-test("recall runs in a child process and returns the session's ranked units", async () => {
+test("tier 1 returns the session's ranked units in process", async () => {
   await withStore(async ({ project, db }) => {
     insertUnits(db, addSource(db, "A"), "A", units("A", 25));
-    closeDb(db);
-    const rows = await recallUnits(project, { sessionId: "A", match: unitMatch("zebra marker"), maxSourceId: 1e9, limit: 8, prelimit: 500 });
-    assert.equal(rows.length, 8);
-    assert.ok(rows.every((u) => u.body.includes(" A ")));
-    Object.assign(db, { raw: (await openDb(project)).raw }); // the store's own close() in withStore needs an open handle
+    const ro = await openDb(project, { readOnly: true });
+    const t1 = recallTierOne(ro, { sessionId: "A", match: unitMatch("zebra marker"), maxSourceId: 1e9, limit: 8, prelimit: 500 }, 900);
+    assert.equal(t1.units.length, 8);
+    assert.equal(t1.interrupted, false);
+    assert.ok(t1.units.every((u) => u.body.includes(" A ")));
+    closeDb(ro);
   });
 });
 
-test("past the deadline recall is empty, the call still resolves, and the timeout is logged", async () => {
+test("past its deadline a query aborts mid-statement and tier 1 reports the interrupt with no units", async () => {
   await withStore(async ({ project, db }) => {
-    insertUnits(db, addSource(db, "A"), "A", units("A", 25));
-    const rows = await recallUnits(project, { sessionId: "A", match: unitMatch("zebra"), maxSourceId: 1e9, limit: 8, prelimit: 500 }, 1);
-    assert.deepEqual(rows, []);
-    const log = readFileSync(join(project.projectDir, RECALL_TIMEOUT_LOG), "utf8");
-    assert.match(log, /deadline \d+ms\n$/);
+    insertUnits(db, addSource(db, "A"), "A", Array.from({ length: 3000 }, (_, ord) => ({ ord, body: "zebra row " + ord })));
+    const ro = await openDb(project, { readOnly: true });
+    assert.throws(() => unitQuery(ro.raw, { sessionId: "A", match: "zebra", maxSourceId: 1e9, limit: 8, prelimit: 500, deadline: performance.now() - 1 }), /recall deadline/);
+    const t1 = recallTierOne(ro, { sessionId: "A", match: "zebra", maxSourceId: 1e9, limit: 8, prelimit: 500 }, 0);
+    assert.deepEqual(t1.units, []);
+    closeDb(ro);
   });
 });
 
-test("a store the worker cannot open fails open to empty recall", async () => {
-  await withStore(async ({ root, project }) => {
-    const rows = await recallUnits({ ...project, dbPath: join(root, "missing", "context.db") }, { sessionId: "A", match: "zebra", maxSourceId: 1e9, limit: 8, prelimit: 500 });
-    assert.deepEqual(rows, []);
+test("the recall budget is min(900, 3500 - elapsed - 500) and prompts without signal skip recall", () => {
+  assert.equal(recallBudgetMs(100), 900);
+  assert.equal(recallBudgetMs(2500), 500);
+  assert.ok(recallBudgetMs(3200) <= 0);
+  assert.equal(recallSkipReason("continue"), "confirmation");
+  assert.equal(recallSkipReason("ok."), "confirmation");
+  assert.equal(recallSkipReason("/compact"), "slash");
+  assert.equal(recallSkipReason("why now"), "short");
+  assert.equal(recallSkipReason("why did the deploy roll back on canary-3"), null);
+});
+
+test("the read-only prompt path cannot write: a write on the recall connection fails", async () => {
+  await withStore(async ({ project }) => {
+    const ro = await openDb(project, { readOnly: true });
+    assert.throws(() => ro.raw.exec("INSERT INTO meta(key, value) VALUES ('x', 'y')"));
+    closeDb(ro);
+  });
+});
+
+test("a session over its byte cap evicts its oldest units down to the low mark, tracked in session_bytes", async () => {
+  await withStore(({ db }) => {
+    const id = addSource(db, "A");
+    const caps = { cap: 100000, low: 60000 };
+    for (let round = 0; round < 4; round++) insertUnits(db, id, "A", Array.from({ length: 100 }, (_, i) => ({ ord: round * 100 + i, body: "w".repeat(300) + " " + (round * 100 + i) })), caps);
+    const tracked = db.raw.prepare("SELECT total_bytes AS n FROM session_bytes WHERE session_id = 'A'").get().n;
+    const actual = db.raw.prepare(`SELECT SUM(LENGTH(CAST(c0 AS BLOB))) AS n FROM "${unitTableName("A")}_content"`).get().n;
+    assert.equal(tracked, actual, "the tracked total matches the stored text");
+    assert.ok(tracked <= caps.cap && tracked > 0);
+    assert.equal(db.raw.prepare(`SELECT max(ord) AS m FROM "${unitTableName("A")}"`).get().m, 399, "the newest unit stays");
+    assert.ok(db.raw.prepare(`SELECT min(ord) AS m FROM "${unitTableName("A")}"`).get().m > 0, "the oldest went first");
+    deleteChunkRows(db.raw, { session: "A" });
+    assert.equal(db.raw.prepare("SELECT count(*) AS n FROM session_bytes WHERE session_id = 'A'").get().n, 0);
   });
 });
 
@@ -157,9 +187,69 @@ test("over the size cap the least recently active session goes first, the newest
       insertUnits(db, addSource(db, s), s, units(s, 200));
       db.raw.prepare("UPDATE sources SET accessed_ts = ? WHERE session_id = ?").run(now - age * 86400000, s);
     }
-    const result = pruneStore(db, { capBytes: 1, now });
+    const result = pruneStore(db, { highBytes: 1, lowBytes: 1, now });
     assert.equal(result.sessionsDeleted, 2);
     assert.equal(queryUnits(db, "newest", "zebra", 10).length, 10, "the session active within the grace window stays");
     assert.equal(queryUnits(db, "oldest", "zebra", 10).length, 0);
   });
+});
+
+test("the hot window searches only the session's newest rows and loses none inside it", async () => {
+  await withStore(async ({ project, db }) => {
+    insertUnits(db, addSource(db, "A"), "A", Array.from({ length: 300 }, (_, ord) => ({ ord, body: "zebra unit " + ord })));
+    const ro = await openDb(project, { readOnly: true });
+    const q = { sessionId: "A", match: "zebra", maxSourceId: 1e9, limit: 1000, prelimit: 500, deadline: performance.now() + 5000 };
+    const ords = (rows) => rows.map((u) => u.ord).sort((a, b) => a - b);
+    assert.equal(unitQuery(ro.raw, { ...q, window: 100 }).length, 100);
+    assert.deepEqual(ords(unitQuery(ro.raw, { ...q, window: 100 })), Array.from({ length: 100 }, (_, i) => 200 + i), "exactly the newest 100");
+    assert.equal(unitQuery(ro.raw, { ...q, window: 8000 }).length, 300, "a window wider than the table loses nothing");
+    closeDb(ro);
+  });
+});
+
+test("a prompt on a project with no store yet is allowed: recall fails open instead of failing the hook", async () => {
+  const { handleHook } = await import("../src/core/hooks/dispatch.ts");
+  const root = mkdtempSync(join(tmpdir(), "cm-failopen-"));
+  const old = process.env.HOME;
+  try {
+    const out = await handleHook("claude-code", { hook_event_name: "UserPromptSubmit", session_id: "s-new", cwd: root, prompt: "what did the deploy script print earlier" }, { HOME: root, USERPROFILE: root, CLAUDE_PROJECT_DIR: root, PATH: process.env.PATH });
+    assert.deepEqual(out, { stdout: "", exitCode: 0 });
+  } finally {
+    process.env.HOME = old;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a store created without INCREMENTAL auto_vacuum is rebuilt once, then reclaim returns freed pages to the filesystem", async () => {
+  const { migrateAutoVacuum, reclaim } = await import("../src/core/store/cleanup.ts");
+  const { DatabaseSync } = await import("node:sqlite");
+  const root = mkdtempSync(join(tmpdir(), "cm-av-"));
+  try {
+    const path = join(root, "context.db");
+    const raw = new DatabaseSync(path);
+    raw.exec("PRAGMA journal_mode = WAL; CREATE TABLE t(x BLOB)");
+    const ins = raw.prepare("INSERT INTO t VALUES (?)");
+    for (let i = 0; i < 400; i++) ins.run(Buffer.alloc(8192, i));
+    raw.exec("DELETE FROM t; PRAGMA wal_checkpoint(TRUNCATE)");
+    const before = statSync(path).size;
+    const db = { raw, path, projectKey: "k" };
+    assert.equal(raw.prepare("PRAGMA auto_vacuum").get().auto_vacuum, 0);
+    assert.ok(raw.prepare("PRAGMA freelist_count").get().freelist_count > 0);
+    // At auto_vacuum 0 reclaim cannot shrink the file: it leaves the free pages (the P0 a pruning loop depended on).
+    reclaim(db);
+    assert.equal(statSync(path).size, before);
+    assert.equal(migrateAutoVacuum(db, () => 95), false, "a busy disk defers the rebuild");
+    assert.equal(raw.prepare("PRAGMA auto_vacuum").get().auto_vacuum, 0);
+    assert.equal(migrateAutoVacuum(db, () => 0), true);
+    assert.equal(raw.prepare("PRAGMA auto_vacuum").get().auto_vacuum, 2);
+    assert.ok(statSync(path).size < before / 4, "the rebuild returned the free pages");
+    // Now deletes free pages that reclaim returns.
+    for (let i = 0; i < 400; i++) ins.run(Buffer.alloc(8192, i));
+    raw.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    const full = statSync(path).size;
+    raw.exec("DELETE FROM t; PRAGMA wal_checkpoint(TRUNCATE)");
+    reclaim(db, 1000, () => 0);
+    assert.ok(statSync(path).size < full / 4, "reclaim shrank the file");
+    raw.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

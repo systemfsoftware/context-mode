@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import path, { dirname, join, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { handleHook } from "../src/core/hooks/dispatch.ts";
+import { drain } from "../src/core/hooks/spool.ts";
 import { ctxSearch } from "../src/core/tools/search.ts";
 import { ctxStats } from "../src/core/tools/stats.ts";
 import { chunkText } from "../src/core/index/chunk.ts";
@@ -30,6 +31,20 @@ import { READ_DENY_MESSAGE } from "../src/core/policy/read-deny.ts";
 import { pathToFileURL } from "node:url";
 import { shouldHint } from "../src/core/hooks/throttle.ts";
 import { renderState } from "../src/core/compaction/render.ts";
+
+// UserPromptSubmit takes no write lock: its prompt row (and recall's seen markers) go to the project spool, applied by the next
+// writer or the server's timer. A test that reads the journal applies the spool first, as that writer would.
+async function applySpools(home) {
+  const projects = join(home, ".context-mode", "projects");
+  if (!existsSync(projects)) return;
+  for (const key of readdirSync(projects)) {
+    const dir = join(projects, key);
+    const project = { projectKey: key, projectDir: dir, dbPath: join(dir, "context.db"), worktree: home, containmentRoot: home, agent: "claude-code", source: "env:CLAUDE_PROJECT_DIR" };
+    const db = await openDb(project);
+    try { drain(project, db); } finally { closeDb(db); }
+  }
+}
+
 
 // Line units live in one FTS5 table per session: lu_ + the first 24 hex of sha1(session id).
 const luName = (sid) => "lu_" + createHash("sha1").update(sid).digest("hex").slice(0, 24);
@@ -188,6 +203,7 @@ describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () =
     const p = cc({ hook_event_name: "UserPromptSubmit", prompt: "find the bug" });
     const out = await handleHook("claude-code", p, env);
     assert.deepEqual(out, { stdout: "", exitCode: 0 });
+    await applySpools(root);
     const rows = await waitRows("SELECT kind, body, ok FROM events WHERE session_id = ?", [p.session_id], 1);
     assert.deepEqual(rows.map((r) => ({ ...r })), [{ kind: "prompt", body: "find the bug", ok: 1 }]);
   });
@@ -1327,10 +1343,12 @@ describe("PRD-v2 section 10: compaction delivery, recall and decision rows (GP6)
   test("[M4] GP6/decision-option-echo-ref-seq: the next prompt echoing an option writes A/ref with the offering turn's seq", async () => {
     const s = sid();
     await handleHook("claude-code", payload(s, { hook_event_name: "UserPromptSubmit", prompt: "can we release?" }), env);
+    await applySpools(root);
     const [first] = await waitRows("SELECT seq FROM events WHERE session_id = ? AND kind = 'prompt'", [s], 1);
     await handleHook("claude-code", ask(s, "", QUESTIONS), env); // offered, not answered in the tool
     await waitRows("SELECT 1 FROM meta WHERE key = ?", [DECISION_SOURCE + ":" + DECISION_OPTION_KEY + ":" + s], 1);
     await handleHook("claude-code", payload(s, { hook_event_name: "UserPromptSubmit", prompt: "  ship IT \n" }), env);
+    await applySpools(root);
     await waitRows("SELECT 1 FROM events WHERE session_id = ? AND kind = 'decision'", [s], 1);
     assert.deepEqual(decisionsOf(s), [{ key: DECISION_OPTION_KEY, body: "A: Ship it\nref: #" + first.seq, tool: "AskUserQuestion", ok: 1 }]);
     // the prompt row is still written; the decision row is extra (ADR-0009 §8.2)
@@ -1338,6 +1356,7 @@ describe("PRD-v2 section 10: compaction delivery, recall and decision rows (GP6)
     assert.equal(prompts.length, 2);
     // the offer applies to the next prompt only
     await handleHook("claude-code", payload(s, { hook_event_name: "UserPromptSubmit", prompt: "Ship it" }), env);
+    await applySpools(root);
     await waitRows("SELECT 1 FROM events WHERE session_id = ? AND kind = 'prompt'", [s], 3);
     await settle();
     assert.equal(decisionsOf(s).length, 1);
@@ -1938,11 +1957,12 @@ describe("PRD-v2 section 10: hook entry argv and stdin handling (GP7)", () => {
     assert.equal(none.stdout, "");
   });
 
-  test("detached journal write lands before the process ends (D-M3-H2-8)", () => {
+  test("the prompt row is spooled before the process ends and lands when the spool is applied (D-M3-H2-8)", async () => {
     const p = { session_id: "e2", cwd: repo, hook_event_name: "UserPromptSubmit", prompt: "hello entry" };
     const r = run(["--agent", "claude-code"], JSON.stringify(p));
     assert.equal(r.status, 0);
     assert.equal(r.stdout, "");
+    await applySpools(root);
     const projects = join(root, ".context-mode", "projects");
     const db = join(projects, readdirSync(projects)[0], "context.db");
     assert.ok(existsSync(db));
@@ -2010,6 +2030,7 @@ describe("PRD-v2 section 10: hook entry argv and stdin handling (GP7)", () => {
     assert.ok(r.ms < HOOK_TIMEOUT_MS / 2, `hook took ${r.ms} ms under a held write lock (host kills it at ${HOOK_TIMEOUT_MS} ms); stderr: ${r.stderr}`);
     // The lock is free: the next hook in the project runs, and the row written under the lock is in the journal.
     assert.equal(timedRun(JSON.stringify({ ...warm, prompt: "after the lock" })).status, 0);
+    await applySpools(root);
     const bodies = readRows("SELECT body FROM events WHERE session_id = ? AND kind = 'prompt' ORDER BY seq", "lk1").map((x) => x.body);
     assert.deepEqual(bodies, ["warm", "written under the lock", "after the lock"]);
   });
@@ -2038,13 +2059,14 @@ describe("PRD-v2 section 10: hook entry argv and stdin handling (GP7)", () => {
     assert.ok(out.stdout.includes("ctx_search("));
     // The lock is free: after the next hook in the project, the whole output is stored and searchable.
     assert.equal(timedRun(JSON.stringify({ ...warm, prompt: "next" })).status, 0);
+    await applySpools(root);
     const src = readRows("SELECT id, bytes_total FROM sources WHERE session_id = ?", "lk2");
     assert.deepEqual(src.map((x) => x.bytes_total), [Buffer.byteLength(full)], "one source row for the output");
     assert.ok(readRows("SELECT ord FROM chunks WHERE source_id = ?", src[0].id).length > 0, "chunks stored");
     assert.ok(unitsOfSource(readRows, src[0].id).length > 0, "line units stored");
   });
 
-  test("GP7/codex-session-project-dir: codex sessions in X and Y write to their own project", () => {
+  test("GP7/codex-session-project-dir: codex sessions in X and Y write to their own project", async () => {
     const x = join(root, "x");
     const y = join(root, "y");
     for (const d of [x, y]) { mkdirSync(d); execFileSync("git", ["init", "-q", d]); }
@@ -2054,6 +2076,8 @@ describe("PRD-v2 section 10: hook entry argv and stdin handling (GP7)", () => {
       const r = spawnSync(process.execPath, [ENTRY, "--agent", "codex"], { input: JSON.stringify(p), cwd: root, env, encoding: "utf8" });
       assert.equal(r.status, 0);
     }
+    await applySpools(root);
+    {
     const projects = join(root, ".context-mode", "projects");
     const seen = {};
     for (const k of readdirSync(projects)) {
@@ -2066,6 +2090,7 @@ describe("PRD-v2 section 10: hook entry argv and stdin handling (GP7)", () => {
     }
     assert.equal(seen["cx-a"], realpathSync.native(x));
     assert.equal(seen["cx-b"], realpathSync.native(y));
+    }
   });
 });
 

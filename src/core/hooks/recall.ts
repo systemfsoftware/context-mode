@@ -1,68 +1,59 @@
-// The hook's unit recall search under a deadline. node:sqlite is synchronous, so a timer on the thread that runs the
-// query cannot fire until the query returns, and a worker thread blocked in a native read cannot be stopped (the
-// process waits for it at exit). The query runs in a child process on its own read-only connection; this process
-// owns the timer and kills the child at the deadline. Past RECALL_DEADLINE_MS recall is empty and the hook succeeds.
-// D-CI-PERF-7: node:fs through getBuiltinModule; a static ESM import of node:fs also loads fs/promises, readline and streams.
-const { appendFileSync, statSync } = process.getBuiltinModule("node:fs") as typeof import("node:fs");
-import { join } from "node:path";
-import { RECALL_BUSY_TIMEOUT_MS, RECALL_DEADLINE_MS, RECALL_TIMEOUT_LOG } from "../contracts/constants.ts";
-import type { ProjectContext, UnitCandidate } from "../contracts/types.ts";
+// The hook's unit recall under a wall-clock governor. node:sqlite has no progress handler, so a query is bounded
+// cooperatively: unitQuery registers a SQL function that throws once the deadline has passed and calls it per candidate row,
+// which aborts the statement. Time is measured from process start (performance.now), so runtime startup counts against the
+// hook's ceiling. Recall runs in the hook process on a read-only connection; it writes nothing.
+import { HOOK_CEILING_MS, RECALL_BUDGET_MS, RECALL_HOT_WINDOW, RECALL_MIN_PROMPT_CHARS, RECALL_RESERVE_MS, RECALL_TIER1_MS } from "../contracts/constants.ts";
+import type { DbHandle, UnitCandidate } from "../contracts/types.ts";
 import { unitQuery, type UnitQuery } from "../store/fts.ts";
 
-const LOG_MAX_BYTES = 65536;
+// The governor's clock. A hook process measures from process start (runtime startup counts against the ceiling); a host that
+// runs hooks in its own long-lived process (OpenCode, Pi) measures from each hook's entry.
+let processClock = false;
+let base = 0;
 
-// The child's program: unitQuery's own source, run on the connection described by argv[1] (JSON).
-const CHILD_SOURCE =
-  "const { DatabaseSync } = require('node:sqlite');" +
-  `const unitQuery = ${unitQuery.toString()};` +
-  "const a = JSON.parse(process.argv[1]);" +
-  "const raw = new DatabaseSync(a.dbPath, { readOnly: true, timeout: a.busyMs });" +
-  "process.stdout.write(JSON.stringify(unitQuery(raw, a.query)));" +
-  "raw.close();";
-
-function logTimeout(project: ProjectContext, reason: string, ms: number): void {
-  try {
-    const path = join(project.projectDir, RECALL_TIMEOUT_LOG);
-    try {
-      if (statSync(path).size > LOG_MAX_BYTES) return;
-    } catch { /* no log yet */ }
-    appendFileSync(path, new Date().toISOString() + " " + reason + " " + String(ms) + "ms\n");
-  } catch { /* the log is a signal, never a failure */ }
+/** The hook CLI entry: time runs from process start. */
+export function useProcessClock(): void {
+  processClock = true;
 }
 
-/** Ranked units for a prompt, or [] when the search errors or passes the deadline. Never throws. */
-export async function recallUnits(project: ProjectContext, query: UnitQuery, deadlineMs: number = RECALL_DEADLINE_MS): Promise<UnitCandidate[]> {
-  if (query.match === "" || query.sessionId === "") return [];
-  const started = Date.now();
-  // Loaded here, not at the top: every hook event loads this module, and only a recall needs a child process.
-  const { spawn } = await import("node:child_process");
-  return new Promise((resolve) => {
-    let done = false;
-    let out = "";
-    const finish = (rows: UnitCandidate[], failure?: string): void => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      if (failure !== undefined) logTimeout(project, failure, Date.now() - started);
-      try {
-        child.kill("SIGKILL");
-        child.stdout.destroy();
-        child.unref();
-      } catch { /* already gone */ }
-      resolve(rows);
-    };
-    const timer = setTimeout(() => finish([], "deadline"), deadlineMs);
-    const child = spawn(process.execPath, ["-e", CHILD_SOURCE, JSON.stringify({ dbPath: project.dbPath, busyMs: RECALL_BUSY_TIMEOUT_MS, query })], { stdio: ["ignore", "pipe", "ignore"] });
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (d: string) => { out += d; });
-    child.once("error", (e) => finish([], "error:" + e.message));
-    child.once("close", (code) => {
-      if (code !== 0) return finish([], "error:exit " + String(code));
-      try {
-        finish(JSON.parse(out) as UnitCandidate[]);
-      } catch {
-        finish([], "error:bad output");
-      }
-    });
-  });
+/** A hook begins: with the process clock, base stays 0 (process start); otherwise it is now. */
+export function beginHook(): void {
+  base = processClock ? 0 : performance.now();
+}
+
+export function hookElapsedMs(): number {
+  return performance.now() - base;
+}
+
+/** ms left for recall: min(RECALL_BUDGET_MS, ceiling - elapsed - reserve); 0 or less means none. */
+export function recallBudgetMs(elapsedMs: number = hookElapsedMs()): number {
+  return Math.min(RECALL_BUDGET_MS, HOOK_CEILING_MS - elapsedMs - RECALL_RESERVE_MS);
+}
+
+const CONFIRMATIONS = new Set(["continue", "yes", "no", "ok", "okay", "y", "n", "go", "go on", "proceed", "thanks", "thank you", "sure", "done", "next", "lgtm", "yep", "nope"]);
+
+/** A prompt with too little signal to search for: null when recall should run, else the skip reason. */
+export function recallSkipReason(prompt: string): string | null {
+  const p = prompt.trim();
+  if (p.startsWith("/")) return "slash";
+  if (CONFIRMATIONS.has(p.toLowerCase().replace(/[.!]+$/, ""))) return "confirmation";
+  if (p.length < RECALL_MIN_PROMPT_CHARS) return "short";
+  return null;
+}
+
+export interface TierOne { units: UnitCandidate[]; interrupted: boolean; ms: number }
+
+/** Tier 1: the current session's units within min(RECALL_TIER1_MS, budget). An interrupt keeps nothing (a ranked query returns at the end). */
+export function recallTierOne(db: DbHandle, query: UnitQuery, budgetMs: number): TierOne {
+  const started = performance.now();
+  const limit = Math.min(RECALL_TIER1_MS, budgetMs);
+  if (limit <= 0 || query.match === "" || query.sessionId === "") return { units: [], interrupted: false, ms: 0 };
+  try {
+    const units = unitQuery(db.raw, { ...query, deadline: started + limit, window: RECALL_HOT_WINDOW });
+    return { units, interrupted: false, ms: performance.now() - started };
+  } catch (err) {
+    const interrupted = /recall deadline/.test(String((err as Error).message));
+    if (!interrupted) process.stderr.write("hooks: recall failed: " + String((err as Error).message) + "\n");
+    return { units: [], interrupted, ms: performance.now() - started };
+  }
 }
