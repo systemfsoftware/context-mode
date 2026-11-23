@@ -102,6 +102,11 @@ export function pruneStore(db: DbHandle, opts: PruneOptions = {}): PruneResult {
     db.raw.exec("VACUUM");
   }
 
+  // The shared table an older build wrote is dead weight here (nothing reads it); an older build still running may refill it.
+  if (db.raw.prepare("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'line_units'").get() !== undefined) {
+    withWrite(db, (h) => { h.raw.exec("DELETE FROM line_units"); });
+  }
+
   for (const s of lastActiveBySession(db.raw)) {
     if (s.at >= cutoff) break;
     deleteSession(db, s.session);

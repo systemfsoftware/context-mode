@@ -36,10 +36,12 @@ async function withStore(fn) {
   try { await fn({ root, project, db }); } finally { closeDb(db); rmSync(root, { recursive: true, force: true }); }
 }
 
-test("the store has no shared line_units table and a sources(session_id, id) index", async () => {
+test("units go to a per-session table and index on sources(session_id, id); the legacy shared table stays untouched", async () => {
   await withStore(({ db }) => {
-    assert.equal(db.raw.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name = 'line_units'").get().n, 0);
+    insertUnits(db, addSource(db, "A"), "A", units("A", 3));
     assert.equal(db.raw.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name = 'idx_sources_session_id'").get().n, 1);
+    assert.equal(db.raw.prepare("SELECT count(*) AS n FROM line_units").get().n, 0, "an older build's table is neither read nor written");
+    assert.equal(db.raw.prepare("PRAGMA user_version").get().user_version, 6);
   });
 });
 
@@ -136,7 +138,9 @@ test("retention deletes sessions idle past the TTL, keeps active ones, and ages 
     const legacy = join(root, "sessions"); mkdirSync(legacy);
     writeFileSync(join(legacy, "stale.db"), "x"); writeFileSync(join(legacy, "fresh.db"), "x");
     utimesSync(join(legacy, "stale.db"), new Date(old), new Date(old));
+    db.raw.prepare("INSERT INTO line_units(body, source_id, session_id, ord) VALUES ('zebra', 1, 'live', 0)").run();
     const result = pruneStore(db, { legacyDirs: [legacy] });
+    assert.equal(db.raw.prepare("SELECT count(*) AS n FROM line_units").get().n, 0, "the shared table an older build wrote is emptied");
     assert.equal(result.sessionsDeleted, 1);
     assert.equal(result.legacyFilesDeleted, 1);
     assert.equal(queryUnits(db, "old", "zebra", 10).length, 0);

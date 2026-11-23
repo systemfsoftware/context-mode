@@ -486,7 +486,7 @@ describe("ADR-0002: schema", { concurrency: CONC }, () => {
 
   test("SCHEMA_VERSION equals the constants.ts SCHEMA_VERSION", () => {
     assert.equal(SCHEMA_VERSION, C.SCHEMA_VERSION);
-    assert.equal(SCHEMA_VERSION, 7); // v7: line units per session; D-PATH-LABEL-1: v6 path labels use forward slashes; D-M5-arch-2: v2 adds the cost dedup index; D-SEARCH-3: v3 chunks title + porter; D-SEARCH-4: v4 trigram; r3-ledger: v5 line_units
+    assert.equal(SCHEMA_VERSION, 6); // D-PATH-LABEL-1: v6 path labels use forward slashes; D-M5-arch-2: v2 adds the cost dedup index; D-SEARCH-3: v3 chunks title + porter; D-SEARCH-4: v4 trigram; r3-ledger: v5 line_units
   });
 
   test("v2 (D-M5-arch-2): a fresh DB has the partial unique index events(session_id, turn) WHERE kind = 'cost'", () => {
@@ -900,7 +900,7 @@ describe("ADR-0002: cost row dedup", { concurrency: CONC }, () => {
   }
 
   test("[M5] SCHEMA_VERSION is 6 after the Usage/cost dedup migration (2), the search title + porter migration (3, D-SEARCH-3), the trigram table (4, D-SEARCH-4) and line units (5, r3-ledger) and path labels (6, D-PATH-LABEL-1)", () => {
-    assert.equal(SCHEMA_VERSION, 7);
+    assert.equal(SCHEMA_VERSION, 6);
   });
 
   test("[M5] cost-dedup/usage-events-idempotent-per-turn: 3 step-finish events in one turn journal once", async (t) => {
