@@ -2,7 +2,7 @@
 // pruneStore: session retention + size cap, run out of band against the open project's own DB.
 // sweepDeadProjects: whole-project delete; the live-PID check and the delete decision run in one
 // BEGIN IMMEDIATE (#880 race class). Never on a timer: the caller runs both once (D-M1-11).
-import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import {
@@ -10,12 +10,14 @@ import {
   DB_SHM_SUFFIX,
   DB_TIMEOUT_MS,
   DB_WAL_SUFFIX,
-  INCREMENTAL_VACUUM_PAGES,
+  INCREMENTAL_VACUUM_BATCH,
   MS_PER_DAY,
   PROJECT_DEAD_IDLE_DAYS,
   PROJECTS_DIR_NAME,
   RETENTION_IDLE_DAYS,
-  RETENTION_SIZE_CAP_BYTES,
+  STORE_HIGH_BYTES,
+  STORE_LOW_BYTES,
+  WAL_TRUNCATE_BYTES,
 } from "../contracts/constants.ts";
 import { CtxError } from "../contracts/errors.ts";
 import type { DbHandle } from "../contracts/types.ts";
@@ -27,12 +29,15 @@ import { applyMigrations } from "./schema.ts";
 export interface PruneOptions {
   now?: number;
   ttlDays?: number;
-  capBytes?: number;
+  /** Physical bytes (context.db + context.db-wal) above which eviction starts. */
+  highBytes?: number;
+  /** Live-page bytes at which eviction stops. */
+  lowBytes?: number;
   /** Directories of old per-session database files (v1 sessions/); aged out and counted against the cap. */
   legacyDirs?: readonly string[];
 }
 
-export interface PruneResult { sessionsDeleted: number; legacyFilesDeleted: number; usedBytes: number }
+export interface PruneResult { sessionsDeleted: number; legacyFilesDeleted: number; physicalBytes: number; liveBytes: number }
 
 const ACTIVE_GRACE_MS = 3600000; // a session active within the last hour is never evicted for the cap
 
@@ -41,8 +46,31 @@ function pragmaNumber(raw: DatabaseSync, name: string): number {
   return Number(Object.values(row)[0]);
 }
 
-function usedDbBytes(raw: DatabaseSync): number {
+function liveBytes(raw: DatabaseSync): number {
   return (pragmaNumber(raw, "page_count") - pragmaNumber(raw, "freelist_count")) * pragmaNumber(raw, "page_size");
+}
+
+function fileSize(path: string): number {
+  try {
+    return statSync(path).size;
+  } catch {
+    return 0;
+  }
+}
+
+/** What the store costs on disk: the database file and its WAL. */
+export function physicalBytes(dbPath: string): number {
+  return fileSize(dbPath) + fileSize(dbPath + DB_WAL_SUFFIX);
+}
+
+/** The IO pressure the kernel reports (some avg10); null when unreadable. Maintenance waits while it is at MAINT_PSI_MAX or more. */
+export function ioPressure(): number | null {
+  try {
+    const m = /some avg10=([\d.]+)/.exec(readFileSync("/proc/pressure/io", "utf8"));
+    return m === null ? null : Number(m[1]);
+  } catch {
+    return null;
+  }
 }
 
 function legacyFiles(dirs: readonly string[]): Array<{ path: string; size: number; mtime: number }> {
@@ -73,34 +101,42 @@ function lastActiveBySession(raw: DatabaseSync): Array<{ session: string; at: nu
   return rows.map((r) => ({ session: r.s, at: Number(r.t) }));
 }
 
-// One session leaves the store whole: chunks, trigram rows, its unit table, sources and journal rows.
+// One session leaves the store whole: chunks, trigram rows, its unit table, sources and journal rows. The WAL is
+// checkpointed after each, so a long prune never leaves a multi-GB WAL for every reader to scan.
 function deleteSession(db: DbHandle, session: string): void {
   withWrite(db, (h) => {
     deleteChunkRows(h.raw, { session });
     h.raw.prepare("DELETE FROM sources WHERE session_id = ?").run(session);
     h.raw.prepare("DELETE FROM events WHERE session_id = ?").run(session);
   });
+  db.raw.exec("PRAGMA wal_checkpoint(PASSIVE)");
+}
+
+/** Return freed pages to the filesystem in small steps (never a full VACUUM, which holds an exclusive lock for the whole file). */
+export function reclaim(db: DbHandle, steps: number = 8): void {
+  for (let i = 0; i < steps; i++) {
+    if (pragmaNumber(db.raw, "freelist_count") === 0) break;
+    db.raw.exec("PRAGMA incremental_vacuum(" + String(INCREMENTAL_VACUUM_BATCH) + ")");
+  }
+  db.raw.exec("PRAGMA wal_checkpoint(PASSIVE)");
+  if (fileSize(db.path + DB_WAL_SUFFIX) > WAL_TRUNCATE_BYTES) db.raw.exec("PRAGMA wal_checkpoint(TRUNCATE)");
 }
 
 /**
- * Retention, run out of band (the server, at most hourly; never a hook). A session with no activity for ttlDays is
- * deleted whole; legacy per-session files older than that go too; then, while the store (context.db's live pages
- * plus the legacy files) is over capBytes, the least recently active session or file goes first. Freed pages are
- * returned to the filesystem with an incremental vacuum.
+ * Retention, run out of band (the server; never a hook). A session with no activity for ttlDays is deleted whole; legacy
+ * per-session files older than that go too. Then, while the store's physical bytes (db + wal) are over highBytes, the least
+ * recently active session goes first until live pages are down to lowBytes (hysteresis: eviction does not restart on the next
+ * write). Pages are returned with incremental vacuum steps and the WAL is checkpointed.
  */
 export function pruneStore(db: DbHandle, opts: PruneOptions = {}): PruneResult {
   const now = opts.now ?? Date.now();
   const cutoff = now - (opts.ttlDays ?? RETENTION_IDLE_DAYS) * MS_PER_DAY;
-  const cap = opts.capBytes ?? RETENTION_SIZE_CAP_BYTES;
+  const high = opts.highBytes ?? STORE_HIGH_BYTES;
+  const low = opts.lowBytes ?? STORE_LOW_BYTES;
   const legacyDirs = opts.legacyDirs ?? [];
   let sessionsDeleted = 0;
   let legacyFilesDeleted = 0;
-
-  // INCREMENTAL auto_vacuum only applies to a database built with it or rebuilt once by VACUUM.
-  if (pragmaNumber(db.raw, "auto_vacuum") !== 2) {
-    db.raw.exec("PRAGMA auto_vacuum = INCREMENTAL");
-    db.raw.exec("VACUUM");
-  }
+  db.raw.exec("PRAGMA journal_size_limit = " + String(WAL_TRUNCATE_BYTES));
 
   // The shared table an older build wrote is dead weight here (nothing reads it); an older build still running may refill it.
   if (db.raw.prepare("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'line_units'").get() !== undefined) {
@@ -124,22 +160,22 @@ export function pruneStore(db: DbHandle, opts: PruneOptions = {}): PruneResult {
   files = legacyFiles(legacyDirs).sort((a, b) => a.mtime - b.mtime);
 
   let legacyBytes = files.reduce((n, f) => n + f.size, 0);
-  for (const f of files) {
-    if (usedDbBytes(db.raw) + legacyBytes <= cap) break;
-    rmSync(f.path, { force: true });
-    legacyBytes -= f.size;
-    legacyFilesDeleted += 1;
+  if (physicalBytes(db.path) + legacyBytes > high || (opts.highBytes !== undefined && liveBytes(db.raw) + legacyBytes > high)) {
+    for (const f of files) {
+      if (liveBytes(db.raw) + legacyBytes <= low) break;
+      rmSync(f.path, { force: true });
+      legacyBytes -= f.size;
+      legacyFilesDeleted += 1;
+    }
+    for (const s of lastActiveBySession(db.raw)) {
+      if (liveBytes(db.raw) + legacyBytes <= low) break;
+      if (s.at >= now - ACTIVE_GRACE_MS) break;
+      deleteSession(db, s.session);
+      sessionsDeleted += 1;
+    }
   }
-  for (const s of lastActiveBySession(db.raw)) {
-    if (usedDbBytes(db.raw) + legacyBytes <= cap) break;
-    if (s.at >= now - ACTIVE_GRACE_MS) break;
-    deleteSession(db, s.session);
-    db.raw.exec("PRAGMA incremental_vacuum(" + String(INCREMENTAL_VACUUM_PAGES) + ")");
-    sessionsDeleted += 1;
-  }
-  db.raw.exec("PRAGMA incremental_vacuum(" + String(INCREMENTAL_VACUUM_PAGES) + ")");
-  db.raw.exec("PRAGMA wal_checkpoint(PASSIVE)");
-  return { sessionsDeleted, legacyFilesDeleted, usedBytes: usedDbBytes(db.raw) + legacyBytes };
+  reclaim(db);
+  return { sessionsDeleted, legacyFilesDeleted, physicalBytes: physicalBytes(db.path) + legacyBytes, liveBytes: liveBytes(db.raw) + legacyBytes };
 }
 
 function userVersion(raw: DatabaseSync): number {

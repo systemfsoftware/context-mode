@@ -992,7 +992,7 @@ describe("ADR-0002: retention cleanup and dead-project sweep", { concurrency: CO
       const now = Date.now();
       insertSource(db, { session_id: "older", accessed_ts: now - 2 * C.MS_PER_DAY });
       insertSource(db, { session_id: "newer", accessed_ts: now });
-      pruneStore(db, { capBytes: 1, now });
+      pruneStore(db, { highBytes: 1, lowBytes: 1, now });
       assert.deepEqual(db.raw.prepare("SELECT session_id FROM sources").all().map((r) => r.session_id), ["newer"]);
       closeDb(db);
     } finally {

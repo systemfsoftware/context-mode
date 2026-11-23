@@ -9,7 +9,7 @@ import {
   HOOK_BUSY_MS, HOOK_SPOOL_DIR, SPOOL_CLAIM_STALE_MS, SPOOL_DRAIN_MS, SQLITE_BUSY_CODE, SQLITE_PRIMARY_CODE_MASK,
 } from "../contracts/constants.ts";
 import type { Chunk, DbHandle, NewJournalRow, ProjectContext } from "../contracts/types.ts";
-import { openDb, withWrite } from "../store/db.ts";
+import { metaSet, openDb, withWrite } from "../store/db.ts";
 import { appendEvent } from "../journal/append.ts";
 import { deleteChunkRows, insertChunks, insertUnits, reserveSource, type SourceDraft } from "../store/fts.ts";
 import { chunkText } from "../index/chunk.ts";
@@ -19,6 +19,7 @@ import { buildUnits } from "../index/units.ts";
  * the reserved source row (null: not written yet), max the chunk size, units whether line units are written too. */
 export type SpoolOp =
   | { t: "row"; row: NewJournalRow; at: number }
+  | { t: "meta"; key: string; value: string }
   | { t: "src"; id: number | null; src: SourceDraft; text: string; max: number; units: boolean };
 
 const OP_SUFFIX = ".json";
@@ -64,6 +65,10 @@ export function spool(project: ProjectContext, op: SpoolOp): void {
 function runOp(db: DbHandle, op: SpoolOp, chunks: Chunk[] | undefined, cur: { op: SpoolOp }): number | null {
   if (op.t === "row") {
     appendEvent(db, op.row, op.at);
+    return null;
+  }
+  if (op.t === "meta") {
+    metaSet(db, op.key, op.value);
     return null;
   }
   const c = chunks ?? chunkText(op.text, "text", op.max);
@@ -152,6 +157,43 @@ function claim(dir: string, name: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** Whether the spool holds a journal row of this session: a first prompt no writer has applied yet. */
+export function spooledSessionRow(project: ProjectContext, sessionId: string): boolean {
+  const dir = spoolDir(project);
+  let names: string[];
+  try {
+    names = readdirSync(dir).filter((n) => n.endsWith(OP_SUFFIX));
+  } catch {
+    return false;
+  }
+  for (const name of names) {
+    try {
+      const op = JSON.parse(readFileSync(join(dir, name), "utf8")) as SpoolOp;
+      if (op.t === "row" && op.row.session_id === sessionId) return true;
+    } catch { /* claimed or torn */ }
+  }
+  return false;
+}
+
+/** The newest spooled value of a meta key, or null: the seen markers a prompt wrote and no writer has applied yet. */
+export function spooledMeta(project: ProjectContext, key: string): string | null {
+  const dir = spoolDir(project);
+  let names: string[];
+  try {
+    names = readdirSync(dir).filter((n) => n.endsWith(OP_SUFFIX)).sort();
+  } catch {
+    return null;
+  }
+  let found: string | null = null;
+  for (const name of names) {
+    try {
+      const op = JSON.parse(readFileSync(join(dir, name), "utf8")) as SpoolOp;
+      if (op.t === "meta" && op.key === key) found = op.value;
+    } catch { /* claimed or torn: the writer has it */ }
+  }
+  return found;
 }
 
 /**

@@ -6,7 +6,7 @@
 // M2: ftsInsert returns the new id (D-M2-1); ftsQueryTimeline (ADR-0009 §8.1, DECISIONS-r9 M14-M18,
 // D-M2-3, D-M2-T3-1); rankTexts, the in-memory BM25 form selectChunksInMemory calls (impl/05 §5 step 2).
 import { CtxError } from "../contracts/errors.ts";
-import { DECISION_SOURCE, ECHO_MAX_BYTES, INDEX_WRITE_CHUNK, LABEL_PREVIEW_BYTES, MEMORY_LABEL_PREFIX, RECALL_MAX_TERMS, RECALL_PRELIMIT, RECALL_QUERY_MAX_TERMS, RRF_K, SNIPPET_MAX_BYTES, SOURCE_HANDLE_MAX_DIGITS, UNIT_BODY_MAX_CHARS, UNIT_MAX_ROWS_PER_SESSION } from "../contracts/constants.ts";
+import { DECISION_SOURCE, ECHO_MAX_BYTES, INDEX_WRITE_CHUNK, LABEL_PREVIEW_BYTES, MEMORY_LABEL_PREFIX, RECALL_MAX_TERMS, RECALL_PRELIMIT, RECALL_QUERY_MAX_TERMS, RRF_K, SNIPPET_MAX_BYTES, SOURCE_HANDLE_MAX_DIGITS, OUTPUT_MAX_BYTES, SESSION_CAP_BYTES, SESSION_LOW_BYTES, UNIT_BODY_MAX_CHARS, UNIT_MAX_ROWS_PER_SESSION } from "../contracts/constants.ts";
 import type { DatabaseSync, StatementSync } from "node:sqlite";
 import type { Chunk, DbHandle, Hit, ProjectContext, SearchScope, SourceRow, TimelineRow, UnitCandidate } from "../contracts/types.ts";
 import { withWrite } from "./db.ts";
@@ -188,6 +188,7 @@ export function deleteChunkRows(raw: DatabaseSync, scope: ChunkScope): number {
   if ("session" in scope) {
     raw.prepare(TRI_DELETE + " WHERE session_id = ?").run(scope.session);
     dropUnitTable(raw, scope.session);
+    if (raw.prepare("SELECT 1 AS x FROM sqlite_master WHERE name = 'session_bytes'").get() !== undefined) raw.prepare("DELETE FROM session_bytes WHERE session_id = ?").run(scope.session);
     return Number(raw.prepare("DELETE FROM chunks WHERE session_id = ?").run(scope.session).changes);
   }
   const [where, arg] = "sourceId" in scope
@@ -862,12 +863,37 @@ export function dropUnitTable(raw: DatabaseSync, sessionId: string): void {
   if (unitTableExists(raw, t)) raw.exec(`DROP TABLE "${t}"`);
 }
 
-/** Store one output's line units in its session's table, batched like ftsInsert (at most INDEX_WRITE_CHUNK bytes per withWrite). */
-export function insertUnits(db: DbHandle, sourceId: number, sessionId: string, units: ReadonlyArray<{ ord: number; body: string }>): void {
+const UNIT_BYTES = (body: string): number => Buffer.byteLength(body, "utf8");
+
+/** The ingest writer's bookkeeping of a session's unit text, kept inside the transaction that writes the units. */
+const SESSION_BYTES_DDL = "CREATE TABLE IF NOT EXISTS session_bytes(session_id TEXT PRIMARY KEY, total_bytes INTEGER NOT NULL, updated_at INTEGER NOT NULL)";
+
+/** Evict a session's oldest units (FIFO) until its tracked bytes are at SESSION_LOW_BYTES; returns the bytes left. */
+function evictSession(raw: DatabaseSync, table: string, total: number, lowBytes: number): number {
+  let remaining = total;
+  const rows = raw.prepare(`SELECT id, LENGTH(CAST(c0 AS BLOB)) AS n FROM "${table}_content" ORDER BY id`);
+  let lastId = -1;
+  for (const r of rows.iterate() as Iterable<{ id: number; n: number }>) {
+    if (remaining <= lowBytes) break;
+    remaining -= Number(r.n);
+    lastId = Number(r.id);
+  }
+  if (lastId >= 0) raw.prepare(`DELETE FROM "${table}" WHERE rowid <= ?`).run(lastId);
+  return remaining;
+}
+
+/**
+ * Store one output's line units in its session's table, batched like ftsInsert (at most INDEX_WRITE_CHUNK bytes per
+ * withWrite). One output indexes at most OUTPUT_MAX_BYTES of unit text. The session's byte total is tracked in
+ * session_bytes inside the same transaction; past SESSION_CAP_BYTES the session's oldest units go, down to SESSION_LOW_BYTES.
+ */
+export function insertUnits(db: DbHandle, sourceId: number, sessionId: string, units: ReadonlyArray<{ ord: number; body: string }>,
+  caps: { cap: number; low: number } = { cap: SESSION_CAP_BYTES, low: SESSION_LOW_BYTES }): void {
   if (units.length === 0) return;
   const table = unitTableName(sessionId);
   let start = 0;
-  while (start < units.length) {
+  let outputBytes = 0;
+  while (start < units.length && outputBytes < OUTPUT_MAX_BYTES) {
     let end = start;
     let bytes = 0;
     while (end < units.length && (end === start || bytes + (units[end] as { body: string }).body.length <= INDEX_WRITE_CHUNK)) {
@@ -877,15 +903,26 @@ export function insertUnits(db: DbHandle, sourceId: number, sessionId: string, u
     const from = start;
     withWrite(db, (h) => {
       // No schema version change: an older build sharing this store keeps its (now unused) line_units table and keeps working.
-      h.raw.exec(`CREATE INDEX IF NOT EXISTS idx_sources_session_id ON sources(session_id, id); CREATE VIRTUAL TABLE IF NOT EXISTS "${table}" USING fts5(body, source_id UNINDEXED, ord UNINDEXED, ${FTS_TOKENIZE})`);
+      h.raw.exec(`CREATE INDEX IF NOT EXISTS idx_sources_session_id ON sources(session_id, id); ${SESSION_BYTES_DDL}; CREATE VIRTUAL TABLE IF NOT EXISTS "${table}" USING fts5(body, source_id UNINDEXED, ord UNINDEXED, ${FTS_TOKENIZE})`);
       const ins = h.raw.prepare(`INSERT INTO "${table}"(body, source_id, ord) VALUES (?, ?, ?)`);
+      let added = 0;
       for (let i = from; i < end; i++) {
         const u = units[i] as { ord: number; body: string };
-        ins.run(u.body.length > UNIT_BODY_MAX_CHARS ? u.body.slice(0, UNIT_BODY_MAX_CHARS) : u.body, sourceId, u.ord);
+        const body = u.body.length > UNIT_BODY_MAX_CHARS ? u.body.slice(0, UNIT_BODY_MAX_CHARS) : u.body;
+        ins.run(body, sourceId, u.ord);
+        added += UNIT_BYTES(body);
       }
-      // The session's cap: the oldest rows (lowest rowids) leave. MAX alone reads the b-tree end.
+      outputBytes += added;
+      const prev = h.raw.prepare("SELECT total_bytes AS n FROM session_bytes WHERE session_id = ?").get(sessionId) as { n: number } | undefined;
+      let total = (prev === undefined ? 0 : Number(prev.n)) + added;
+      // The row cap: the oldest rows (lowest rowids) leave; the byte total is then re-read from the table. MAX alone reads the b-tree end.
       const top = h.raw.prepare(`SELECT MAX(id) AS n FROM "${table}_content"`).get() as { n: number | null };
-      if (top.n !== null && top.n > UNIT_MAX_ROWS_PER_SESSION) h.raw.prepare(`DELETE FROM "${table}" WHERE rowid <= ?`).run(top.n - UNIT_MAX_ROWS_PER_SESSION);
+      if (top.n !== null && top.n > UNIT_MAX_ROWS_PER_SESSION) {
+        h.raw.prepare(`DELETE FROM "${table}" WHERE rowid <= ?`).run(top.n - UNIT_MAX_ROWS_PER_SESSION);
+        total = Number((h.raw.prepare(`SELECT COALESCE(SUM(LENGTH(CAST(c0 AS BLOB))), 0) AS n FROM "${table}_content"`).get() as { n: number }).n);
+      }
+      if (total > caps.cap) total = evictSession(h.raw, table, total, caps.low);
+      h.raw.prepare("INSERT INTO session_bytes(session_id, total_bytes, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET total_bytes = excluded.total_bytes, updated_at = excluded.updated_at").run(sessionId, total, Date.now());
     });
     start = end;
   }
@@ -897,23 +934,40 @@ export function readMaxSourceId(db: DbHandle): number {
   return Number(row.n);
 }
 
-export interface UnitQuery { sessionId: string; match: string; maxSourceId: number; limit: number; prelimit: number }
+export interface UnitQuery { sessionId: string; match: string; maxSourceId: number; limit: number; prelimit: number; deadline?: number; window?: number }
 
 /**
  * One ranked query over a session's line units, best first, -bm25 as the score. Self-contained on purpose: the
- * recall worker runs this function's source text on its own connection (hooks/recall.ts), so it names nothing from
- * this module. The newest `prelimit` matches are ranked; older ones are never scored.
+ * The newest `prelimit` matches are ranked; older ones are never scored. With `deadline` (a performance.now() value) the
+ * statement aborts, throwing "recall deadline", once that time passes: a SQL function checked per candidate row.
  */
 export function unitQuery(raw: DatabaseSync, q: UnitQuery): UnitCandidate[] {
   const crypto = process.getBuiltinModule("node:crypto") as typeof import("node:crypto");
   const t = "lu_" + crypto.createHash("sha1").update(q.sessionId).digest("hex").slice(0, 24);
   if (q.match === "" || raw.prepare("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?").get(t) === undefined) return [];
+  const gov = q.deadline !== undefined;
+  if (gov) {
+    const deadline = q.deadline as number;
+    raw.function("gov", () => {
+      if (performance.now() > deadline) throw new Error("recall deadline");
+      return 0;
+    });
+  }
+  const g = gov ? " AND gov() = 0" : "";
+  // The hot window: only the session's newest `window` rows are searched. Rowids in a session's own table only grow, so the bound is exact.
+  let lo = -1;
+  if (q.window !== undefined) {
+    const top = raw.prepare(`SELECT MAX(id) AS n FROM "${t}_content"`).get() as { n: number | null };
+    lo = top.n === null ? -1 : Math.max(-1, Number(top.n) - q.window);
+  }
+  const hot = q.window !== undefined;
   const rows = raw.prepare(
     `SELECT u.source_id AS source_id, u.ord AS ord, u.body AS body, -bm25("${t}") AS score, s.label AS label ` +
     `FROM "${t}" u JOIN sources s ON s.id = u.source_id ` +
-    `WHERE "${t}" MATCH ? AND u.rowid IN (SELECT rowid FROM "${t}" WHERE "${t}" MATCH ? ORDER BY rowid DESC LIMIT ?) AND s.id <= ? ` +
-    `ORDER BY bm25("${t}") LIMIT ?`,
-  ).all(q.match, q.match, q.prelimit, q.maxSourceId, q.limit) as Array<{ source_id: number; ord: number; body: string; score: number; label: string }>;
+    (hot
+      ? `WHERE "${t}" MATCH ? AND u.rowid > ? AND s.id <= ?${g} ORDER BY bm25("${t}") LIMIT ?`
+      : `WHERE "${t}" MATCH ? AND u.rowid IN (SELECT rowid FROM "${t}" WHERE "${t}" MATCH ?${g} ORDER BY rowid DESC LIMIT ?) AND s.id <= ?${g} ORDER BY bm25("${t}") LIMIT ?`),
+  ).all(...(hot ? [q.match, lo, q.maxSourceId, q.limit] : [q.match, q.match, q.prelimit, q.maxSourceId, q.limit])) as Array<{ source_id: number; ord: number; body: string; score: number; label: string }>;
   return rows.map((r) => ({ sourceId: Number(r.source_id), ord: Number(r.ord), label: r.label, body: r.body, score: r.score }));
 }
 

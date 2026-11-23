@@ -8,7 +8,7 @@ import { AGENT_IDS, type AgentId } from "../contracts/agents.ts";
 import {
   COMPACTED_META_PREFIX, COMPACT_POINTER_LINE, COMPACT_STATE_KEY, DECISION_OPTION_KEY, DECISION_SOURCE, DECISION_TOOL, EDIT_PATH_KEYS, EDIT_TOOLS, EXIT_CODE_LINE_PREFIX,
   OWN_TOOL_PREFIX, MCP_SERVER_TOOL_PREFIX, PLUGIN_CALL_ID_PREFIX, prefixToolNames, MAX_CHUNK_BYTES, REPLACE_CHUNK_BYTES, REPLACE_HANDLE_LINE, REPLACE_RETURN_BYTES, REPLACE_TRIGGER_BYTES, RANGE_READ_TOOLS, READ_PATH_KEYS, SKILL_LOAD_TOOLS, READ_RANGE_KEYS, SHAPE_RETURN_BYTES, PARSE_ERROR_DENY_LINE, PENDING_COMPACT_FLAG, PENDING_COMPACT_KEY,
-  PENDING_COMPACT_META_PREFIX, POLICY_UNREADABLE_LINE, RECALL_KEY, RECALL_MAX_ROWS, RECALL_PRELIMIT, RECALL_SEEN_META_PREFIX, RECALL_UNIT_CANDIDATES, RECALL_UNITS_SEEN_META_PREFIX, RESUME_HINT, RESUME_HINT_KEY, RUN_WRAPPER_FILE,
+  PENDING_COMPACT_META_PREFIX, POLICY_UNREADABLE_LINE, RECALL_KEY, RECALL_MAX_ROWS, RECALL_PRELIMIT, RECALL_READ_BUSY_MS, RECALL_TIER2_MIN_MS, RECALL_SEEN_META_PREFIX, RECALL_UNIT_CANDIDATES, RECALL_UNITS_SEEN_META_PREFIX, RESUME_HINT, RESUME_HINT_KEY, RUN_WRAPPER_FILE,
   RUN_WRAPPER_AGENT, RUN_WRAPPER_NODE, PERSISTED_FILE_LINE, SEARCH_TWIN_LINE, SEARCH_WRAPPER_FILE, SUBAGENT_HANDLE_LINE, ECHO_MAX_BYTES, SHELL_TOOL, SOURCE_LABEL_MAX_CHARS, SUBAGENT_SOURCE_PREFIX, SYNC_INDEX_MAX_BYTES, TOOL_PREFIX_SLOT,
   USER_DENY_REASON_PREFIX,
   SUBAGENT_RUN_DENY, WORKSPACE_FOLDER_FLAG, PROJECTS_DIR_NAME, CLAUDE_TOOL_RESULTS_DIR_NAME, PERSISTED_OUTPUT_MAX_BYTES,
@@ -24,7 +24,7 @@ import { readUserDeny } from "../policy/user-deny.ts";
 import { resolveProject } from "../project/resolve.ts";
 import { claudeDirOf, homeDirOf } from "../project/config-dir.ts";
 import { isInside } from "../project/contain.ts";
-import { metaGet, metaSet, metaTake } from "../store/db.ts";
+import { metaGet, metaSet, metaTake, openDb } from "../store/db.ts";
 import { canonicalKey } from "../journal/append.ts";
 import { hasAgentRows, hasSessionRows, lastSessionSeq, readLastPrompt, readMaxSeq, readRecallRows, readSessionEvents } from "../journal/read.ts";
 import { readMaxSourceId, recallQueryText, unitMatch, reserveSource, sourceHandle, type SourceDraft } from "../store/fts.ts";
@@ -34,8 +34,9 @@ import { chunkText } from "../index/chunk.ts";
 import { moreLine, selectChunksInMemory } from "../index/select.ts";
 import { shapeDigest } from "../index/shape.ts";
 import { appendDetached } from "./detached.ts";
-import { recallUnits } from "./recall.ts";
-import { hookDb, isBusy, spool, writeDetached, writeOrSpool, type SpoolOp } from "./spool.ts";
+import { beginHook, recallBudgetMs, recallSkipReason, recallTierOne } from "./recall.ts";
+import { telemetryDb, telemetryPhase, telemetryRecall, telemetryStart } from "./telemetry.ts";
+import { drain, hookDb, isBusy, spool, spooledMeta, spooledSessionRow, writeDetached, writeOrSpool, type SpoolOp } from "./spool.ts";
 import { askedWords } from "./handle-query.ts";
 import { answerDecisions, askOptionLabels, optionEchoDecision, type DecisionPart } from "./decision.ts";
 import { shouldHint } from "./throttle.ts";
@@ -67,6 +68,7 @@ export async function handleHook(agent: AgentId, raw: unknown, env: NodeJS.Proce
     process.stderr.write("hooks: unknown agent " + JSON.stringify(agent) + "\n"); // step 1, A22, D-FU-PS-1
     return EMPTY;
   }
+  beginHook();
   const row = getAdapter(agent);
   // D-HNE-GUARD-1: every failure below ends in failureOutput (exit 0, this host's shape, tool table only) and a log line.
   const report = (stage: string, err: unknown, line?: string): void => {
@@ -95,6 +97,7 @@ export async function handleHook(agent: AgentId, raw: unknown, env: NodeJS.Proce
   }
   // D-1323-CODEX-STOP-1: Stop has no project or store work; it gets this agent's allow reply before the project step.
   if (ev.event === "Stop") return row.encode(ev, ALLOW);
+  telemetryStart(ev.event, ev.sessionId);
   let project: ProjectContext;
   try {
     fault(env, "project");
@@ -163,6 +166,7 @@ async function sessionStart(ev: CanonicalHookEvent, row: AdapterRow, project: Pr
   if (ev.source === "compact" && hasRecall(row)) markCompacted(await hookDb(project), ev.sessionId);
   if (ev.source === "compact" && row.compactDelivery === "sessionstart") {
     const db = await hookDb(project);
+    drain(project, db); // the prompt rows the last turns spooled are part of the state this block renders
     // A23, #1396: the host sends one SessionStart(compact) per compaction with the same session id. The
     // marker key carries the newest journal seq, so each compaction gets its state block and a duplicate
     // delivery of the same compaction (no new row in between) stays silent.
@@ -174,6 +178,7 @@ async function sessionStart(ev: CanonicalHookEvent, row: AdapterRow, project: Pr
   // impl/12 §4.6 step 2, D-M5-P2-4: the OpenCode plugin's one `context` call per session reads and clears
   // the pending-compact marker here (handleHook is the one DB path); its stdout is the cache-stable payload.
   if (row.compactDelivery === "opencode-cache" && metaTake(db, PENDING_COMPACT_META_PREFIX + ev.sessionId) !== null) {
+    drain(project, db);
     return { kind: "hint", text: compactText(db, ev, row), onceKey: PENDING_COMPACT_KEY };
   }
   if (!shouldHint(db, ev.sessionId, RESUME_HINT_KEY)) return ALLOW;
@@ -186,16 +191,23 @@ async function userPromptSubmit(ev: CanonicalHookEvent, row: AdapterRow, project
   const body = ev.prompt ?? "";
   // D-FU-GCH-2: decided before this turn's own prompt row is queued, so that row never counts as "something to resume".
   const resume = await firstTurnResume(ev, row, project);
-  appendDetached(project, ev.sessionId, {
-    session_id: ev.sessionId, worktree: project.worktree, agent: ev.agent, kind: "prompt", tool: null, key: null,
-    path: null, ok: 1, exit_code: null, bytes: Buffer.byteLength(body), body, turn: ev.turn ?? 0,
-    sandbox_bytes: 0, returned_bytes: 0,
-  });
+  // The prompt row goes to the spool, never to the store: UserPromptSubmit takes no write lock. The next hook write or the
+  // server's timer applies it with the time it was taken.
+  try {
+    spool(project, { t: "row", at: Date.now(), row: {
+      session_id: ev.sessionId, worktree: project.worktree, agent: ev.agent, kind: "prompt", tool: null, key: null,
+      path: null, ok: 1, exit_code: null, bytes: Buffer.byteLength(body), body, turn: ev.turn ?? 0,
+      sandbox_bytes: 0, returned_bytes: 0,
+    } });
+  } catch (err) {
+    process.stderr.write("hooks: prompt spool failed: " + message(err) + "\n");
+  }
   echoDetached(ev, project, body);
   if (row.compactDelivery === "pending-flag") {
     const db = await hookDb(project);
     // §4.4 step 2.2: DELETE ... RETURNING inside BEGIN IMMEDIATE, so the delivery fires once.
     if (metaTake(db, PENDING_COMPACT_META_PREFIX + ev.sessionId) !== null) {
+      drain(project, db);
       return { kind: "hint", text: compactText(db, ev, row), onceKey: PENDING_COMPACT_KEY };
     }
   }
@@ -211,7 +223,7 @@ async function userPromptSubmit(ev: CanonicalHookEvent, row: AdapterRow, project
 async function firstTurnResume(ev: CanonicalHookEvent, row: AdapterRow, project: ProjectContext): Promise<Decision | null> {
   if (row.eventMap.SessionStart !== undefined || ev.sessionId === "") return null;
   const db = await hookDb(project);
-  if (hasSessionRows(db, ev.sessionId)) return null;
+  if (hasSessionRows(db, ev.sessionId) || spooledSessionRow(project, ev.sessionId)) return null;
   if (!shouldHint(db, ev.sessionId, RESUME_HINT_KEY)) return null;
   if (!hasAgentRows(db, project.worktree, ev.agent)) return null;
   return { kind: "hint", text: withPrefix(RESUME_HINT, row), onceKey: RESUME_HINT_KEY };
@@ -267,21 +279,39 @@ function seenUnitKeys(value: string | null): string[] {
 // prompt; whole rows over RECALL_MIN_SCORE, within RECALL_BUDGET_BYTES; a row goes out once per session.
 async function recall(ev: CanonicalHookEvent, row: AdapterRow, project: ProjectContext, prompt: string): Promise<Decision> {
   if (!hasRecall(row) || ev.sessionId === "") return ALLOW;
-  const db = await hookDb(project);
+  const skip = recallSkipReason(prompt);
+  if (skip !== null) {
+    telemetryRecall({ skip });
+    return ALLOW;
+  }
+  // The prompt path only reads: a read-only connection, and every write (the seen markers) goes to the spool, applied after the answer is out.
+  const opened = performance.now();
+  const db = await openDb(project, { readOnly: true });
+  db.raw.exec("PRAGMA query_only = ON; PRAGMA busy_timeout = " + String(RECALL_READ_BUSY_MS) + "; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -16384");
+  telemetryDb(project.dbPath);
+  telemetryPhase("db_open", performance.now() - opened);
   const compacted = metaGet(db, COMPACTED_META_PREFIX + ev.sessionId);
   if (compacted === null) return ALLOW;
   const boundary = compactBoundary(compacted);
   const seenKey = RECALL_SEEN_META_PREFIX + ev.sessionId;
-  const seen = seenSeqs(metaGet(db, seenKey));
+  const seen = seenSeqs(spooledMeta(project, seenKey) ?? metaGet(db, seenKey));
   // r3-ledger: one ranked query over this session's line units, by the current prompt only (D-1330-RECALL-PROMPT-1).
   const unitsKey = RECALL_UNITS_SEEN_META_PREFIX + ev.sessionId;
-  const seenUnits = seenUnitKeys(metaGet(db, unitsKey));
-  const units = await recallUnits(project, { sessionId: ev.sessionId, match: unitMatch(recallQueryText(prompt)), maxSourceId: boundary.source, limit: RECALL_UNIT_CANDIDATES, prelimit: RECALL_PRELIMIT });
-  const rows = readRecallRows(db, ev.sessionId, project.worktree, RECALL_MAX_ROWS, boundary.seq);
-  const picked = pickRecall(rows, prompt, new Set(seen), units, new Set(seenUnits));
+  const seenUnits = seenUnitKeys(spooledMeta(project, unitsKey) ?? metaGet(db, unitsKey));
+  // Tier 1: this session's units, under the governor. Tier 2: the worktree's journal rows, only while budget is left.
+  const t1 = recallTierOne(db, { sessionId: ev.sessionId, match: unitMatch(recallQueryText(prompt)), maxSourceId: boundary.source, limit: RECALL_UNIT_CANDIDATES, prelimit: RECALL_PRELIMIT }, recallBudgetMs());
+  telemetryPhase("recall_t1", t1.ms);
+  let rows: ReturnType<typeof readRecallRows> = [];
+  if (recallBudgetMs() >= RECALL_TIER2_MIN_MS) {
+    const t2 = performance.now();
+    rows = readRecallRows(db, ev.sessionId, project.worktree, RECALL_MAX_ROWS, boundary.seq);
+    telemetryPhase("recall_t2", performance.now() - t2);
+  }
+  const picked = pickRecall(rows, prompt, new Set(seen), t1.units, new Set(seenUnits));
+  telemetryRecall({ interrupted: t1.interrupted, hits: t1.units.length });
   if (picked.text === "") return ALLOW;
-  if (picked.seqs.length > 0) metaSet(db, seenKey, JSON.stringify([...seen, ...picked.seqs]));
-  if (picked.units !== undefined) metaSet(db, unitsKey, JSON.stringify([...seenUnits, ...picked.units]));
+  if (picked.seqs.length > 0) spool(project, { t: "meta", key: seenKey, value: JSON.stringify([...seen, ...picked.seqs]) });
+  if (picked.units !== undefined) spool(project, { t: "meta", key: unitsKey, value: JSON.stringify([...seenUnits, ...picked.units]) });
   return { kind: "hint", text: picked.text, onceKey: RECALL_KEY };
 }
 

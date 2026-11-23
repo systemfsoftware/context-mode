@@ -19,8 +19,9 @@ import { appendEvent, ownCallRow } from "../core/journal/append.ts";
 import { installExitGuard } from "../core/lifecycle/exit.ts";
 import { resolveConfigDir } from "../core/project/config-dir.ts";
 import { resolveProject } from "../core/project/resolve.ts";
-import { pruneStore, sweepDeadProjects } from "../core/store/cleanup.ts";
-import { PRUNE_FIRST_DELAY_MS, PRUNE_INTERVAL_MS, V1_SESSIONS_DIR_NAME } from "../core/contracts/constants.ts";
+import { drain as drainSpool } from "../core/hooks/spool.ts";
+import { ioPressure, physicalBytes, pruneStore, sweepDeadProjects } from "../core/store/cleanup.ts";
+import { MAINT_INTERVAL_MS, SPOOL_DRAIN_INTERVAL_MS, MAINT_PSI_MAX, PRUNE_FIRST_DELAY_MS, PRUNE_INTERVAL_MS, STORE_HIGH_BYTES, V1_SESSIONS_DIR_NAME } from "../core/contracts/constants.ts";
 import { closeDb, openDb } from "../core/store/db.ts";
 import { removeOwnerPid, writeOwnerPid } from "../core/store/owners.ts";
 import { z } from "zod/v4";
@@ -179,17 +180,28 @@ export async function startServer(argv: string[], env: NodeJS.ProcessEnv): Promi
   const held: DbHandle[] = [];
   let cleaned = false; // D-M1-11: cleanup runs once per process, never on a timer
 
-  // Retention runs here, out of band: once shortly after the first open and then at most hourly, never in a hook.
-  function schedulePrune(db: DbHandle): void {
-    const run = (): void => {
+  // Maintenance runs here, out of band, never in a hook: the spool the hooks wrote is applied every tick; prune, incremental
+  // vacuum and checkpoint run hourly (or at once over the high-water mark) and only while IO pressure is below MAINT_PSI_MAX.
+  function schedulePrune(db: DbHandle, project: ProjectContext): void {
+    let last = 0;
+    // The spool is applied every few seconds (a readdir when empty), so a prompt row waits only that long behind the hook.
+    setInterval(() => {
+      try { drainSpool(project, db); } catch (err) { process.stderr.write("context-mode: spool drain failed: " + (err as Error).message + "\n"); }
+    }, SPOOL_DRAIN_INTERVAL_MS).unref();
+    const tick = (): void => {
       try {
+        const psi = ioPressure();
+        if (psi !== null && psi >= MAINT_PSI_MAX) return;
+        const over = physicalBytes(db.path) > STORE_HIGH_BYTES;
+        if (!over && Date.now() - last < PRUNE_INTERVAL_MS) return;
+        last = Date.now();
         const claudeDir = process.env["CLAUDE_CONFIG_DIR"] ?? join(homedir(), ".claude");
         pruneStore(db, { legacyDirs: [join(claudeDir, "context-mode", V1_SESSIONS_DIR_NAME)] });
       } catch (err) {
-        process.stderr.write("context-mode: prune failed: " + (err as Error).message + "\n");
+        process.stderr.write("context-mode: maintenance failed: " + (err as Error).message + "\n");
       }
     };
-    setTimeout(() => { run(); setInterval(run, PRUNE_INTERVAL_MS).unref(); }, PRUNE_FIRST_DELAY_MS).unref();
+    setTimeout(() => { tick(); setInterval(tick, MAINT_INTERVAL_MS).unref(); }, PRUNE_FIRST_DELAY_MS).unref();
   }
 
   // §5 step 6b, D-M1-T7-1: openDb, then writeOwnerPid, then sweepDeadProjects. (The row retention that ran here
@@ -205,7 +217,7 @@ export async function startServer(argv: string[], env: NodeJS.ProcessEnv): Promi
       throw err;
     }
     held.push(db);
-    schedulePrune(db);
+    schedulePrune(db, project);
     if (!cleaned) {
       cleaned = true;
       sweepDeadProjects(configDir);

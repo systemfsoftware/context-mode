@@ -6,6 +6,7 @@
 import type { HookOutput } from "../core/contracts/types.ts";
 import { AGENT_IDS, type AgentId } from "../core/contracts/agents.ts";
 import { AGENT_ARG } from "../core/contracts/constants.ts";
+import { useProcessClock } from "../core/hooks/recall.ts";
 import { failureOutput, handleHook, logHookError, readStdin, writeOut } from "../core/hooks/dispatch.ts";
 
 const EMPTY: HookOutput = { stdout: "", exitCode: 0 };
@@ -56,4 +57,5 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv): Promise<void
   }
 }
 
+useProcessClock();
 void main(process.argv.slice(2), process.env);

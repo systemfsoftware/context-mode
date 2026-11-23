@@ -11,6 +11,7 @@ export const SCHEMA_VERSION: number = SCHEMA_VERSION_CONST;
 // busy_timeout first so a concurrent opener waits instead of failing on the WAL switch.
 const PRAGMAS = `
 PRAGMA busy_timeout = ${DB_TIMEOUT_MS};
+PRAGMA auto_vacuum = INCREMENTAL;
 PRAGMA journal_mode = WAL;
 `;
 
