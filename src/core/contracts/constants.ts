@@ -169,9 +169,12 @@ export const MS_PER_DAY = 86400000; // DEVIATIONS D-M1-3: day-to-ms factor for t
 
 // Store (impl/02 §0; DEVIATIONS D-M1-3: impl/00 names NODE_MIN and INDEX_WRITE_CHUNK cover the rest)
 export const PROJECT_KEY_HEX_LEN = 16; // impl/00 A5: first 16 hex chars of sha256(git common dir realpath)
-export const SCHEMA_VERSION = 6; // ADR-0002 decision 2: PRAGMA user_version; 2 = cost dedup index (D-M5-arch-2); 3 = chunks title + porter (D-SEARCH-3); 4 = trigram table + vocab (D-SEARCH-4); 5 = line_units (r3-ledger); 6 = path labels with forward slashes (D-PATH-LABEL-1)
-export const RETENTION_IDLE_DAYS = 30; // impl/02 A-S1: row-level, age since last access
-export const RETENTION_SIZE_CAP_BYTES = 524288000; // impl/02 A-S2 (Q7b): 500 MB per project
+export const SCHEMA_VERSION = 7; // ADR-0002 decision 2: PRAGMA user_version; 2 = cost dedup index (D-M5-arch-2); 3 = chunks title + porter (D-SEARCH-3); 4 = trigram table + vocab (D-SEARCH-4); 5 = line_units (r3-ledger); 6 = path labels with forward slashes (D-PATH-LABEL-1); 7 = line units move to one FTS5 table per session, sources(session_id, id) index
+export const RETENTION_IDLE_DAYS = 7; // a session with no activity for this long is deleted whole (rows, units, journal)
+export const RETENTION_SIZE_CAP_BYTES = 2147483648; // 2 GiB across context.db and the legacy sessions/ dir; least recently active sessions go first
+export const PRUNE_INTERVAL_MS = 3600000; // prune runs out of band in the server, at most hourly; never on a hook
+export const PRUNE_FIRST_DELAY_MS = 30000;
+export const INCREMENTAL_VACUUM_PAGES = 20000; // pages returned to the filesystem per prune
 export const PROJECT_DEAD_IDLE_DAYS = 14; // DECISIONS-r9 V22 (#1024): project-level sweep, dead owner
 export const PROJECTS_DIR_NAME = "projects"; // PRD §4: <DATA_ROOT>/projects/<projectKey>/
 export const DB_FILE_NAME = "context.db"; // PRD §4: one SQLite file per project
@@ -426,6 +429,13 @@ export const UNITS_ANCESTOR_FACTOR = 8; // D-UNITS-BOUND-1: ancestor copies per 
 // D-1330-RECALL-PROMPT-1 (#1330): the recall query is the current prompt only, its first distinct words up to this
 // count, so a long prompt costs the same as a 64-word one (aron-intframe: prompt only 1 ms, 31/40 found).
 export const RECALL_QUERY_MAX_TERMS = 64;
+export const RECALL_DEADLINE_MS = 1500; // the hook's recall search is abandoned after this and recall is empty; the hook still succeeds
+export const RECALL_BUSY_TIMEOUT_MS = 200; // the recall connection waits this long on a lock
+export const RECALL_MAX_TERMS = 8; // the longest query terms; short common words are the expensive ones
+export const RECALL_PRELIMIT = 500; // newest matches ranked by bm25; the rest are never scored
+export const RECALL_TIMEOUT_LOG = "recall-timeouts.log"; // one line per abandoned recall, in the project dir
+export const UNIT_MAX_ROWS_PER_SESSION = 50000; // oldest units of a session go first
+export const UNIT_BODY_MAX_CHARS = 2048; // a stored unit is cut here
 export const RECALL_UNIT_CANDIDATES = 64; // r3-ledger: line units read per recall query (one ranked FTS query)
 export const RECALL_SEEN_META_PREFIX = "recall_seen:"; // meta key + session id: JSON seq list already injected
 export const RECALL_OPEN_TAG = "<context_mode_recall>";

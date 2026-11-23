@@ -59,8 +59,8 @@ describe("ADR-0018: contracts (concurrent)", { concurrency: CONC }, () => {
         DATA_ROOT: "~/.context-mode", LIVE_MODEL: "claude-sonnet-5", LIVE_EFFORT: "low", LIVE_BUDGET_USD: 0.25,
         LIVE_SKIP_LIMIT: 3, RRF_K: 60, SEARCH_P95_MS: 30, HOOK_TIMEOUT_MS: 5000,
         // store additions (impl/02 §0, DEVIATIONS D-M1-3)
-        PROJECT_KEY_HEX_LEN: 16, SCHEMA_VERSION: 6, // D-PATH-LABEL-1: v6 = path labels with forward slashes; r3-ledger: v5 = line_units; D-M5-arch-2: v2 = cost dedup index; D-SEARCH-3: v3 = chunks title + porter; D-SEARCH-4: v4 = trigram table
-        RETENTION_IDLE_DAYS: 30, RETENTION_SIZE_CAP_BYTES: 524288000,
+        PROJECT_KEY_HEX_LEN: 16, SCHEMA_VERSION: 7, // D-PATH-LABEL-1: v6 = path labels with forward slashes; r3-ledger: v5 = line_units; D-M5-arch-2: v2 = cost dedup index; D-SEARCH-3: v3 = chunks title + porter; D-SEARCH-4: v4 = trigram table
+        RETENTION_IDLE_DAYS: 7, RETENTION_SIZE_CAP_BYTES: 2147483648,
         PROJECT_DEAD_IDLE_DAYS: 14, MS_PER_DAY: 86400000,
       };
       for (const [k, v] of Object.entries(want)) assert.equal(C[k], v, k);
