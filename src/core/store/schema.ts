@@ -139,6 +139,14 @@ export const DDL_V6: string = `
 UPDATE sources SET label = replace(label, char(92), '/') WHERE kind = 'path' AND instr(label, char(92)) > 0;
 `;
 
+// Version 7: line units live in one FTS5 table per session (created on first write, see store/fts.ts), so a recall
+// search touches only its own session's rows. The shared table is derived text (recall hints), so it is dropped
+// rather than copied. sources(session_id, id) serves the session lookups.
+export const DDL_V7: string = `
+DROP TABLE IF EXISTS line_units;
+CREATE INDEX IF NOT EXISTS idx_sources_session_id ON sources(session_id, id);
+`;
+
 // Ascending by version; step N brings the DB from N-1 to N.
 const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [
   { version: 1, sql: DDL },
@@ -147,6 +155,7 @@ const MIGRATIONS: ReadonlyArray<{ version: number; sql: string }> = [
   { version: 4, sql: DDL_V4 },
   { version: 5, sql: DDL_V5 },
   { version: 6, sql: DDL_V6 },
+  { version: 7, sql: DDL_V7 },
 ];
 
 export function applyMigrations(db: DatabaseSync, fromVersion: number): void {

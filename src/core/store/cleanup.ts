@@ -1,8 +1,8 @@
 // impl/02 §8, A-S1, A-S2, A-S7, ADR-0002 decision 4, DECISIONS-r9 V22, DEVIATIONS D-M1-11, D-M1-T7-1.
-// cleanupProject: row retention + size cap inside the open project's own DB.
+// pruneStore: session retention + size cap, run out of band against the open project's own DB.
 // sweepDeadProjects: whole-project delete; the live-PID check and the delete decision run in one
 // BEGIN IMMEDIATE (#880 race class). Never on a timer: the caller runs both once (D-M1-11).
-import { existsSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import {
@@ -10,6 +10,7 @@ import {
   DB_SHM_SUFFIX,
   DB_TIMEOUT_MS,
   DB_WAL_SUFFIX,
+  INCREMENTAL_VACUUM_PAGES,
   MS_PER_DAY,
   PROJECT_DEAD_IDLE_DAYS,
   PROJECTS_DIR_NAME,
@@ -23,47 +24,117 @@ import { deleteChunkRows } from "./fts.ts";
 import { listLiveOwners } from "./owners.ts";
 import { applyMigrations } from "./schema.ts";
 
-// §8.1 step 3: a source and its chunks go together.
-function deleteSource(raw: DatabaseSync, id: number): void {
-  raw.prepare("DELETE FROM sources WHERE id = ?").run(id);
-  deleteChunkRows(raw, { sourceId: id });
+export interface PruneOptions {
+  now?: number;
+  ttlDays?: number;
+  capBytes?: number;
+  /** Directories of old per-session database files (v1 sessions/); aged out and counted against the cap. */
+  legacyDirs?: readonly string[];
 }
 
-/** impl/02 §8.1: row-level retention, all inside one withWrite. */
-export function cleanupProject(db: DbHandle, configDir: string): { deletedSources: number; deletedProject: boolean } {
-  return withWrite(db, (h) => {
-    // D-M1-T7-1: no row maps a session to a server, so a live owner keeps every session warm.
-    if (listLiveOwners(configDir, h.projectKey).length > 0) return { deletedSources: 0, deletedProject: false };
-    let deletedSources = 0;
+export interface PruneResult { sessionsDeleted: number; legacyFilesDeleted: number; usedBytes: number }
 
-    // Steps 1-3: age since last access.
-    const cutoff = Date.now() - RETENTION_IDLE_DAYS * MS_PER_DAY;
-    const old = h.raw.prepare("SELECT id FROM sources WHERE accessed_ts < ?").all(cutoff) as Array<{ id: number }>;
-    for (const row of old) {
-      deleteSource(h.raw, row.id);
-      deletedSources += 1;
-    }
+const ACTIVE_GRACE_MS = 3600000; // a session active within the last hour is never evicted for the cap
 
-    // Step 4: size cap, oldest accessed_ts first.
-    // D-R4-RETENTION-1: the cap counts the source bytes and the line units' bytes (the units are stored text too).
-    const sum = h.raw.prepare("SELECT SUM(bytes_total) AS n FROM sources").get() as { n: number | null };
-    const units = h.raw.prepare("SELECT source_id, SUM(LENGTH(CAST(body AS BLOB))) AS n FROM line_units GROUP BY source_id").all() as Array<{ source_id: number; n: number }>;
-    const unitBytes = new Map(units.map((u) => [Number(u.source_id), Number(u.n)]));
-    let totalBytes = (sum.n ?? 0) + [...unitBytes.values()].reduce((a, b) => a + b, 0);
-    if (totalBytes > RETENTION_SIZE_CAP_BYTES) {
-      const byAge = h.raw
-        .prepare("SELECT id, bytes_total FROM sources ORDER BY accessed_ts ASC, id ASC")
-        .all() as Array<{ id: number; bytes_total: number }>;
-      for (const row of byAge) {
-        if (totalBytes <= RETENTION_SIZE_CAP_BYTES) break;
-        deleteSource(h.raw, row.id);
-        totalBytes -= row.bytes_total + (unitBytes.get(Number(row.id)) ?? 0);
-        deletedSources += 1;
-      }
+function pragmaNumber(raw: DatabaseSync, name: string): number {
+  const row = raw.prepare("PRAGMA " + name).get() as Record<string, number>;
+  return Number(Object.values(row)[0]);
+}
+
+function usedDbBytes(raw: DatabaseSync): number {
+  return (pragmaNumber(raw, "page_count") - pragmaNumber(raw, "freelist_count")) * pragmaNumber(raw, "page_size");
+}
+
+function legacyFiles(dirs: readonly string[]): Array<{ path: string; size: number; mtime: number }> {
+  const out: Array<{ path: string; size: number; mtime: number }> = [];
+  for (const dir of dirs) {
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      continue;
     }
-    // A-S7: the open project itself is never deleted here; sweepDeadProjects owns that.
-    return { deletedSources, deletedProject: false };
+    for (const name of names) {
+      try {
+        const st = statSync(join(dir, name));
+        if (st.isFile()) out.push({ path: join(dir, name), size: st.size, mtime: st.mtimeMs });
+      } catch { /* gone between the listing and the stat */ }
+    }
+  }
+  return out;
+}
+
+function lastActiveBySession(raw: DatabaseSync): Array<{ session: string; at: number }> {
+  const rows = raw.prepare(
+    "SELECT session_id AS s, MAX(t) AS t FROM (" +
+    "SELECT session_id, MAX(accessed_ts) AS t FROM sources GROUP BY session_id UNION ALL " +
+    "SELECT session_id, MAX(created_at) AS t FROM events GROUP BY session_id) GROUP BY session_id ORDER BY t ASC",
+  ).all() as Array<{ s: string; t: number }>;
+  return rows.map((r) => ({ session: r.s, at: Number(r.t) }));
+}
+
+// One session leaves the store whole: chunks, trigram rows, its unit table, sources and journal rows.
+function deleteSession(db: DbHandle, session: string): void {
+  withWrite(db, (h) => {
+    deleteChunkRows(h.raw, { session });
+    h.raw.prepare("DELETE FROM sources WHERE session_id = ?").run(session);
+    h.raw.prepare("DELETE FROM events WHERE session_id = ?").run(session);
   });
+}
+
+/**
+ * Retention, run out of band (the server, at most hourly; never a hook). A session with no activity for ttlDays is
+ * deleted whole; legacy per-session files older than that go too; then, while the store (context.db's live pages
+ * plus the legacy files) is over capBytes, the least recently active session or file goes first. Freed pages are
+ * returned to the filesystem with an incremental vacuum.
+ */
+export function pruneStore(db: DbHandle, opts: PruneOptions = {}): PruneResult {
+  const now = opts.now ?? Date.now();
+  const cutoff = now - (opts.ttlDays ?? RETENTION_IDLE_DAYS) * MS_PER_DAY;
+  const cap = opts.capBytes ?? RETENTION_SIZE_CAP_BYTES;
+  const legacyDirs = opts.legacyDirs ?? [];
+  let sessionsDeleted = 0;
+  let legacyFilesDeleted = 0;
+
+  // INCREMENTAL auto_vacuum only applies to a database built with it or rebuilt once by VACUUM.
+  if (pragmaNumber(db.raw, "auto_vacuum") !== 2) {
+    db.raw.exec("PRAGMA auto_vacuum = INCREMENTAL");
+    db.raw.exec("VACUUM");
+  }
+
+  for (const s of lastActiveBySession(db.raw)) {
+    if (s.at >= cutoff) break;
+    deleteSession(db, s.session);
+    sessionsDeleted += 1;
+  }
+
+  let files = legacyFiles(legacyDirs).sort((a, b) => a.mtime - b.mtime);
+  for (const f of files) {
+    if (f.mtime >= cutoff) break;
+    try {
+      rmSync(f.path, { force: true });
+      legacyFilesDeleted += 1;
+    } catch { /* kept; counted below */ }
+  }
+  files = legacyFiles(legacyDirs).sort((a, b) => a.mtime - b.mtime);
+
+  let legacyBytes = files.reduce((n, f) => n + f.size, 0);
+  for (const f of files) {
+    if (usedDbBytes(db.raw) + legacyBytes <= cap) break;
+    rmSync(f.path, { force: true });
+    legacyBytes -= f.size;
+    legacyFilesDeleted += 1;
+  }
+  for (const s of lastActiveBySession(db.raw)) {
+    if (usedDbBytes(db.raw) + legacyBytes <= cap) break;
+    if (s.at >= now - ACTIVE_GRACE_MS) break;
+    deleteSession(db, s.session);
+    db.raw.exec("PRAGMA incremental_vacuum(" + String(INCREMENTAL_VACUUM_PAGES) + ")");
+    sessionsDeleted += 1;
+  }
+  db.raw.exec("PRAGMA incremental_vacuum(" + String(INCREMENTAL_VACUUM_PAGES) + ")");
+  db.raw.exec("PRAGMA wal_checkpoint(PASSIVE)");
+  return { sessionsDeleted, legacyFilesDeleted, usedBytes: usedDbBytes(db.raw) + legacyBytes };
 }
 
 function userVersion(raw: DatabaseSync): number {

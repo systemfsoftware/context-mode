@@ -3,6 +3,7 @@
 // D-M1-11, D-M1-T10-1); adapters (M3) and the tool modules (M2-M5) come with their own milestones.
 import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer, type ServerContext, type StandardSchemaWithJSON } from "@modelcontextprotocol/server";
@@ -18,7 +19,8 @@ import { appendEvent, ownCallRow } from "../core/journal/append.ts";
 import { installExitGuard } from "../core/lifecycle/exit.ts";
 import { resolveConfigDir } from "../core/project/config-dir.ts";
 import { resolveProject } from "../core/project/resolve.ts";
-import { cleanupProject, sweepDeadProjects } from "../core/store/cleanup.ts";
+import { pruneStore, sweepDeadProjects } from "../core/store/cleanup.ts";
+import { PRUNE_FIRST_DELAY_MS, PRUNE_INTERVAL_MS, V1_SESSIONS_DIR_NAME } from "../core/contracts/constants.ts";
 import { closeDb, openDb } from "../core/store/db.ts";
 import { removeOwnerPid, writeOwnerPid } from "../core/store/owners.ts";
 import { z } from "zod/v4";
@@ -177,20 +179,33 @@ export async function startServer(argv: string[], env: NodeJS.ProcessEnv): Promi
   const held: DbHandle[] = [];
   let cleaned = false; // D-M1-11: cleanup runs once per process, never on a timer
 
-  // §5 step 6b, D-M1-11, D-M1-T7-1: openDb, then cleanupProject (before our own owner file, else
-  // its live-owner check always sees us), then writeOwnerPid, then sweepDeadProjects.
+  // Retention runs here, out of band: once shortly after the first open and then at most hourly, never in a hook.
+  function schedulePrune(db: DbHandle): void {
+    const run = (): void => {
+      try {
+        const claudeDir = process.env["CLAUDE_CONFIG_DIR"] ?? join(homedir(), ".claude");
+        pruneStore(db, { legacyDirs: [join(claudeDir, "context-mode", V1_SESSIONS_DIR_NAME)] });
+      } catch (err) {
+        process.stderr.write("context-mode: prune failed: " + (err as Error).message + "\n");
+      }
+    };
+    setTimeout(() => { run(); setInterval(run, PRUNE_INTERVAL_MS).unref(); }, PRUNE_FIRST_DELAY_MS).unref();
+  }
+
+  // §5 step 6b, D-M1-T7-1: openDb, then writeOwnerPid, then sweepDeadProjects. (The row retention that ran here
+  // once is pruneStore now.)
   async function openOwn(project: ProjectContext): Promise<DbHandle> {
     const db = await openDb(project);
     // D-M1-T3-5: the config dir comes from the process env, the same one resolveProject used.
     const configDir = resolveConfigDir(process.env);
     try {
-      if (!cleaned) cleanupProject(db, configDir);
       writeOwnerPid(configDir, project.projectKey, serverId);
     } catch (err) {
       closeDb(db);
       throw err;
     }
     held.push(db);
+    schedulePrune(db);
     if (!cleaned) {
       cleaned = true;
       sweepDeadProjects(configDir);

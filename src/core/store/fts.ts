@@ -6,7 +6,7 @@
 // M2: ftsInsert returns the new id (D-M2-1); ftsQueryTimeline (ADR-0009 §8.1, DECISIONS-r9 M14-M18,
 // D-M2-3, D-M2-T3-1); rankTexts, the in-memory BM25 form selectChunksInMemory calls (impl/05 §5 step 2).
 import { CtxError } from "../contracts/errors.ts";
-import { DECISION_SOURCE, ECHO_MAX_BYTES, INDEX_WRITE_CHUNK, LABEL_PREVIEW_BYTES, MEMORY_LABEL_PREFIX, RECALL_QUERY_MAX_TERMS, RRF_K, SNIPPET_MAX_BYTES, SOURCE_HANDLE_MAX_DIGITS } from "../contracts/constants.ts";
+import { DECISION_SOURCE, ECHO_MAX_BYTES, INDEX_WRITE_CHUNK, LABEL_PREVIEW_BYTES, MEMORY_LABEL_PREFIX, RECALL_MAX_TERMS, RECALL_PRELIMIT, RECALL_QUERY_MAX_TERMS, RRF_K, SNIPPET_MAX_BYTES, SOURCE_HANDLE_MAX_DIGITS, UNIT_BODY_MAX_CHARS, UNIT_MAX_ROWS_PER_SESSION } from "../contracts/constants.ts";
 import type { DatabaseSync, StatementSync } from "node:sqlite";
 import type { Chunk, DbHandle, Hit, ProjectContext, SearchScope, SourceRow, TimelineRow, UnitCandidate } from "../contracts/types.ts";
 import { withWrite } from "./db.ts";
@@ -175,21 +175,37 @@ export function insertChunks(db: DbHandle, id: number, src: SourceDraft, chunks:
 }
 
 // The chunks a delete reaches: one source by id, every source with one label, or all of them.
-export type ChunkScope = { sourceId: number } | { label: string } | "all";
+export type ChunkScope = { sourceId: number } | { label: string } | { session: string } | "all";
 
 // The one place chunk text leaves the store: porter rows, trigram rows and line units go together (D-SEARCH-4).
 // Source rows stay with the caller. Returns the chunk rows deleted.
 export function deleteChunkRows(raw: DatabaseSync, scope: ChunkScope): number {
   if (scope === "all") {
     raw.exec("INSERT INTO chunks_tri(chunks_tri) VALUES ('delete-all')");
-    raw.exec("DELETE FROM line_units");
+    for (const t of unitTables(raw)) raw.exec(`DROP TABLE "${t}"`);
     return Number(raw.prepare("DELETE FROM chunks").run().changes);
+  }
+  if ("session" in scope) {
+    raw.prepare(TRI_DELETE + " WHERE session_id = ?").run(scope.session);
+    dropUnitTable(raw, scope.session);
+    return Number(raw.prepare("DELETE FROM chunks WHERE session_id = ?").run(scope.session).changes);
   }
   const [where, arg] = "sourceId" in scope
     ? ["source_id = ?", scope.sourceId]
     : ["source_id IN (SELECT id FROM sources WHERE label = ?)", scope.label];
   raw.prepare(TRI_DELETE + " WHERE " + where).run(arg);
-  raw.prepare("DELETE FROM line_units WHERE " + where).run(arg);
+  const sessions = "sourceId" in scope
+    ? raw.prepare("SELECT DISTINCT session_id FROM sources WHERE id = ?").all(scope.sourceId)
+    : raw.prepare("SELECT DISTINCT session_id FROM sources WHERE label = ?").all(scope.label);
+  const ids = "sourceId" in scope
+    ? [scope.sourceId]
+    : (raw.prepare("SELECT id FROM sources WHERE label = ?").all(scope.label) as Array<{ id: number }>).map((r) => Number(r.id));
+  for (const row of sessions as Array<{ session_id: string }>) {
+    const t = unitTableName(row.session_id);
+    if (!unitTableExists(raw, t)) continue;
+    const del = raw.prepare(`DELETE FROM "${t}" WHERE source_id = ?`);
+    for (const id of ids) del.run(id);
+  }
   return Number(raw.prepare("DELETE FROM chunks WHERE " + where).run(arg).changes);
 }
 
@@ -825,8 +841,31 @@ export function listSessionSources(db: DbHandle, sessionId: string, limit: numbe
 
 // ---------- r3-ledger line units ----------
 
-/** Store one output's line units, batched like ftsInsert (at most INDEX_WRITE_CHUNK bytes per withWrite). */
+/** The FTS5 table holding one session's line units. The name is a hash, so any session id is a safe identifier. */
+export function unitTableName(sessionId: string): string {
+  const crypto = process.getBuiltinModule("node:crypto") as typeof import("node:crypto");
+  return "lu_" + crypto.createHash("sha1").update(sessionId).digest("hex").slice(0, 24);
+}
+
+function unitTableExists(raw: DatabaseSync, table: string): boolean {
+  return raw.prepare("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) !== undefined;
+}
+
+function unitTables(raw: DatabaseSync): string[] {
+  const rows = raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name GLOB 'lu_[0-9a-f]*' AND name NOT GLOB '*_*_*'").all() as Array<{ name: string }>;
+  return rows.map((r) => r.name);
+}
+
+/** Drop one session's unit table (a no-op when it never had one). */
+export function dropUnitTable(raw: DatabaseSync, sessionId: string): void {
+  const t = unitTableName(sessionId);
+  if (unitTableExists(raw, t)) raw.exec(`DROP TABLE "${t}"`);
+}
+
+/** Store one output's line units in its session's table, batched like ftsInsert (at most INDEX_WRITE_CHUNK bytes per withWrite). */
 export function insertUnits(db: DbHandle, sourceId: number, sessionId: string, units: ReadonlyArray<{ ord: number; body: string }>): void {
+  if (units.length === 0) return;
+  const table = unitTableName(sessionId);
   let start = 0;
   while (start < units.length) {
     let end = start;
@@ -837,14 +876,58 @@ export function insertUnits(db: DbHandle, sourceId: number, sessionId: string, u
     }
     const from = start;
     withWrite(db, (h) => {
-      const ins = h.raw.prepare("INSERT INTO line_units(body, source_id, session_id, ord) VALUES (?, ?, ?, ?)");
+      h.raw.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS "${table}" USING fts5(body, source_id UNINDEXED, ord UNINDEXED, ${FTS_TOKENIZE})`);
+      const ins = h.raw.prepare(`INSERT INTO "${table}"(body, source_id, ord) VALUES (?, ?, ?)`);
       for (let i = from; i < end; i++) {
         const u = units[i] as { ord: number; body: string };
-        ins.run(u.body, sourceId, sessionId, u.ord);
+        ins.run(u.body.length > UNIT_BODY_MAX_CHARS ? u.body.slice(0, UNIT_BODY_MAX_CHARS) : u.body, sourceId, u.ord);
       }
+      // The session's cap: the oldest rows (lowest rowids) leave. MAX alone reads the b-tree end.
+      const top = h.raw.prepare(`SELECT MAX(id) AS n FROM "${table}_content"`).get() as { n: number | null };
+      if (top.n !== null && top.n > UNIT_MAX_ROWS_PER_SESSION) h.raw.prepare(`DELETE FROM "${table}" WHERE rowid <= ?`).run(top.n - UNIT_MAX_ROWS_PER_SESSION);
     });
     start = end;
   }
+}
+
+/** #1394: the newest sources id (0 when none); the unit recall boundary a compaction records. */
+export function readMaxSourceId(db: DbHandle): number {
+  const row = db.raw.prepare("SELECT COALESCE(MAX(id), 0) AS n FROM sources").get() as { n: number };
+  return Number(row.n);
+}
+
+export interface UnitQuery { sessionId: string; match: string; maxSourceId: number; limit: number; prelimit: number }
+
+/**
+ * One ranked query over a session's line units, best first, -bm25 as the score. Self-contained on purpose: the
+ * recall worker runs this function's source text on its own connection (hooks/recall.ts), so it names nothing from
+ * this module. The newest `prelimit` matches are ranked; older ones are never scored.
+ */
+export function unitQuery(raw: DatabaseSync, q: UnitQuery): UnitCandidate[] {
+  const crypto = process.getBuiltinModule("node:crypto") as typeof import("node:crypto");
+  const t = "lu_" + crypto.createHash("sha1").update(q.sessionId).digest("hex").slice(0, 24);
+  if (q.match === "" || raw.prepare("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?").get(t) === undefined) return [];
+  const rows = raw.prepare(
+    `SELECT u.source_id AS source_id, u.ord AS ord, u.body AS body, -bm25("${t}") AS score, s.label AS label ` +
+    `FROM "${t}" u JOIN sources s ON s.id = u.source_id ` +
+    `WHERE "${t}" MATCH ? AND u.rowid IN (SELECT rowid FROM "${t}" WHERE "${t}" MATCH ? ORDER BY rowid DESC LIMIT ?) AND s.id <= ? ` +
+    `ORDER BY bm25("${t}") LIMIT ?`,
+  ).all(q.match, q.match, q.prelimit, q.maxSourceId, q.limit) as Array<{ source_id: number; ord: number; body: string; score: number; label: string }>;
+  return rows.map((r) => ({ sourceId: Number(r.source_id), ord: Number(r.ord), label: r.label, body: r.body, score: r.score }));
+}
+
+/** The match text of a recall query: the RECALL_MAX_TERMS longest terms joined as any-word. */
+export function unitMatch(q: string): string {
+  const terms = searchTerms(q);
+  const picked = terms.length <= RECALL_MAX_TERMS ? terms : [...terms].sort((x, y) => y.length - x.length).slice(0, RECALL_MAX_TERMS);
+  return terms.filter((t) => picked.includes(t)).join(" OR ");
+}
+
+export function queryUnits(
+  db: DbHandle, sessionId: string, q: string, limit: number, maxSourceId: number = Number.MAX_SAFE_INTEGER,
+): UnitCandidate[] {
+  if (sessionId === "") return [];
+  return unitQuery(db.raw, { sessionId, match: unitMatch(q), maxSourceId, limit, prelimit: RECALL_PRELIMIT });
 }
 
 // D-1330-RECALL-PROMPT-1 (#1330): the recall query text is the current prompt only, never the session goal (first
@@ -872,23 +955,3 @@ export function recallQueryText(prompt: string): string {
   return [...(kept.size > 0 ? kept : all)].join(" ");
 }
 
-/** #1394: the newest sources id (0 when none); the unit recall boundary a compaction records. */
-export function readMaxSourceId(db: DbHandle): number {
-  const row = db.raw.prepare("SELECT COALESCE(MAX(id), 0) AS n FROM sources").get() as { n: number };
-  return Number(row.n);
-}
-
-/** One ranked query over this session's line units (any-word form); best first, -bm25 as the score. */
-export function queryUnits(
-  db: DbHandle, sessionId: string, q: string, limit: number, maxSourceId: number = Number.MAX_SAFE_INTEGER,
-): UnitCandidate[] {
-  const match = searchTerms(q).join(" OR ");
-  if (match === "" || sessionId === "") return [];
-  // #1394: maxSourceId keeps out units of outputs stored after the latest compaction (still in live context).
-  const rows = db.raw.prepare(
-    "SELECT u.source_id AS source_id, u.ord AS ord, u.body AS body, -bm25(line_units) AS score, s.label AS label " +
-    "FROM line_units u JOIN sources s ON s.id = u.source_id " +
-    "WHERE line_units MATCH ? AND u.session_id = ? AND s.id <= ? ORDER BY bm25(line_units) LIMIT ?",
-  ).all(match, sessionId, maxSourceId, limit) as Array<{ source_id: number; ord: number; body: string; score: number; label: string }>;
-  return rows.map((r) => ({ sourceId: Number(r.source_id), ord: Number(r.ord), label: r.label, body: r.body, score: r.score }));
-}

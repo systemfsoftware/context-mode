@@ -21,7 +21,7 @@ import * as fts from "../src/core/store/fts.ts";
 import * as dispatch from "../src/core/hooks/dispatch.ts";
 import { appendEvent } from "../src/core/journal/append.ts";
 import { listLiveOwners, removeOwnerPid, writeOwnerPid } from "../src/core/store/owners.ts";
-import { cleanupProject, sweepDeadProjects } from "../src/core/store/cleanup.ts";
+import { pruneStore, sweepDeadProjects } from "../src/core/store/cleanup.ts";
 import { ctxStats } from "../src/core/tools/stats.ts";
 import { ctxSearch } from "../src/core/tools/search.ts";
 import { installExitGuard } from "../src/core/lifecycle/exit.ts";
@@ -486,7 +486,7 @@ describe("ADR-0002: schema", { concurrency: CONC }, () => {
 
   test("SCHEMA_VERSION equals the constants.ts SCHEMA_VERSION", () => {
     assert.equal(SCHEMA_VERSION, C.SCHEMA_VERSION);
-    assert.equal(SCHEMA_VERSION, 6); // D-PATH-LABEL-1: v6 path labels use forward slashes; D-M5-arch-2: v2 adds the cost dedup index; D-SEARCH-3: v3 chunks title + porter; D-SEARCH-4: v4 trigram; r3-ledger: v5 line_units
+    assert.equal(SCHEMA_VERSION, 7); // v7: line units per session; D-PATH-LABEL-1: v6 path labels use forward slashes; D-M5-arch-2: v2 adds the cost dedup index; D-SEARCH-3: v3 chunks title + porter; D-SEARCH-4: v4 trigram; r3-ledger: v5 line_units
   });
 
   test("v2 (D-M5-arch-2): a fresh DB has the partial unique index events(session_id, turn) WHERE kind = 'cost'", () => {
@@ -753,7 +753,10 @@ describe("ADR-0002: shared store helpers", { concurrency: CONC }, () => {
   const count = (raw, sql) => Number(raw.prepare(sql).get().n);
   const PORTER_NEEDLE = "SELECT COUNT(*) AS n FROM chunks WHERE body LIKE '%needle%'";
   const TRI_NEEDLE = "SELECT COUNT(*) AS n FROM chunks_tri WHERE chunks_tri MATCH '\"needle\"'";
-  const UNITS = "SELECT COUNT(*) AS n FROM line_units";
+  const unitCount = (raw, session) => {
+    const t = fts.unitTableName(session);
+    return raw.prepare("SELECT 1 AS x FROM sqlite_master WHERE name = ?").get(t) === undefined ? 0 : count(raw, `SELECT COUNT(*) AS n FROM "${t}"`);
+  };
   const CHUNKS = "SELECT COUNT(*) AS n FROM chunks";
 
   // D-1330-RECALL-PROMPT-1 (#1330): the recall query is the current prompt only, its first distinct
@@ -781,20 +784,20 @@ describe("ADR-0002: shared store helpers", { concurrency: CONC }, () => {
 
       assert.equal(fts.deleteChunkRows(db.raw, { sourceId: a }), 1);
       assert.equal(count(db.raw, CHUNKS), 1);
-      assert.equal(count(db.raw, UNITS), 1);
+      assert.equal(unitCount(db.raw, "s1"), 1);
       assert.equal(count(db.raw, TRI_NEEDLE), 1);
       assert.equal(count(db.raw, PORTER_NEEDLE), 1);
 
       assert.equal(fts.deleteChunkRows(db.raw, { label: "b.txt" }), 1);
       assert.equal(count(db.raw, CHUNKS), 0);
-      assert.equal(count(db.raw, UNITS), 0);
+      assert.equal(unitCount(db.raw, "s1"), 0);
       assert.equal(count(db.raw, TRI_NEEDLE), 0);
 
       const c = fts.ftsInsert(db, src("c.txt"), [{ ord: 0, text: "needle gamma", bytes: 12 }]);
       fts.insertUnits(db, c, "s1", [{ ord: 0, body: "needle gamma" }]);
       assert.equal(fts.deleteChunkRows(db.raw, "all"), 1);
       assert.equal(count(db.raw, CHUNKS), 0);
-      assert.equal(count(db.raw, UNITS), 0);
+      assert.equal(unitCount(db.raw, "s1"), 0);
       assert.equal(count(db.raw, TRI_NEEDLE), 0);
       closeDb(db);
     } finally {
@@ -852,7 +855,7 @@ describe("ADR-0002: source reserve", { concurrency: CONC }, () => {
       const id = reserveSource(db, src(root), chunks);
       finishReserved(db, id, src(root), chunks, [{ ord: 0, body: "alpha beta" }]);
       assert.equal(db.raw.prepare("SELECT COUNT(*) AS n FROM chunks WHERE source_id = ?").get(id).n, 1);
-      assert.equal(db.raw.prepare("SELECT COUNT(*) AS n FROM line_units WHERE source_id = ?").get(id).n, 1);
+      assert.equal(Number(db.raw.prepare(`SELECT COUNT(*) AS n FROM "${fts.unitTableName("s1")}"`).get().n), 1);
       closeDb(db);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -897,7 +900,7 @@ describe("ADR-0002: cost row dedup", { concurrency: CONC }, () => {
   }
 
   test("[M5] SCHEMA_VERSION is 6 after the Usage/cost dedup migration (2), the search title + porter migration (3, D-SEARCH-3), the trigram table (4, D-SEARCH-4) and line units (5, r3-ledger) and path labels (6, D-PATH-LABEL-1)", () => {
-    assert.equal(SCHEMA_VERSION, 6);
+    assert.equal(SCHEMA_VERSION, 7);
   });
 
   test("[M5] cost-dedup/usage-events-idempotent-per-turn: 3 step-finish events in one turn journal once", async (t) => {
@@ -962,52 +965,35 @@ describe("ADR-0002: retention cleanup and dead-project sweep", { concurrency: CO
     );
   }
 
-  test("[M1] GP8/cleanup-dead-owner-old-deleted: cleanupProject deletes rows older than RETENTION_IDLE_DAYS with no live owner", async () => {
-    const root = mkdtempSync(join(tmpdir(), "cm-cleanup-"));
-    try {
-      const project = fakeProject(root, "a".repeat(16));
-      const db = await openDb(project);
-      const oldTs = Date.now() - (C.RETENTION_IDLE_DAYS + 1) * C.MS_PER_DAY;
-      insertSource(db, { session_id: "dead-session", accessed_ts: oldTs });
-      const result = cleanupProject(db, join(root, "cm-config"));
-      assert.equal(result.deletedSources, 1);
-      const left = db.raw.prepare("SELECT COUNT(*) AS n FROM sources").get().n;
-      assert.equal(left, 0);
-      closeDb(db);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("cleanupProject keeps a row whose session is tied to a live owner, regardless of age", async () => {
+  test("pruneStore deletes a session idle past RETENTION_IDLE_DAYS, even with a live owner, and keeps an active one", async () => {
     const root = mkdtempSync(join(tmpdir(), "cm-cleanup-"));
     const configDir = join(root, "cm-config");
     try {
-      const project = fakeProject(root, "b".repeat(16));
+      const project = fakeProject(root, "a".repeat(16));
       const db = await openDb(project);
-      writeOwnerPid(configDir, project.projectKey, "srv-live");
-      const oldTs = Date.now() - (C.RETENTION_IDLE_DAYS + 10) * C.MS_PER_DAY;
-      insertSource(db, { session_id: "s1", accessed_ts: oldTs });
-      const result = cleanupProject(db, configDir);
-      assert.equal(result.deletedSources, 0);
+      writeOwnerPid(configDir, project.projectKey, "srv-live"); // a running server owns the project and never lets its sessions go
+      const oldTs = Date.now() - (C.RETENTION_IDLE_DAYS + 1) * C.MS_PER_DAY;
+      insertSource(db, { session_id: "dead-session", accessed_ts: oldTs });
+      insertSource(db, { session_id: "live-session" });
+      const result = pruneStore(db, {});
+      assert.equal(result.sessionsDeleted, 1);
+      assert.deepEqual(db.raw.prepare("SELECT session_id FROM sources").all().map((r) => r.session_id), ["live-session"]);
       closeDb(db);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("cleanupProject enforces RETENTION_SIZE_CAP_BYTES by deleting the oldest-accessed source first", async () => {
+  test("pruneStore enforces the size cap by deleting the least recently active session first", async () => {
     const root = mkdtempSync(join(tmpdir(), "cm-cleanup-"));
     try {
       const project = fakeProject(root, "c".repeat(16));
       const db = await openDb(project);
       const now = Date.now();
-      insertSource(db, { session_id: "s1", bytes_total: C.RETENTION_SIZE_CAP_BYTES, accessed_ts: now - 1000 });
-      insertSource(db, { session_id: "s1", bytes_total: 1000, accessed_ts: now });
-      const result = cleanupProject(db, join(root, "cm-config"));
-      assert.ok(result.deletedSources >= 1);
-      const left = db.raw.prepare("SELECT SUM(bytes_total) AS n FROM sources").get().n ?? 0;
-      assert.ok(left <= C.RETENTION_SIZE_CAP_BYTES);
+      insertSource(db, { session_id: "older", accessed_ts: now - 2 * C.MS_PER_DAY });
+      insertSource(db, { session_id: "newer", accessed_ts: now });
+      pruneStore(db, { capBytes: 1, now });
+      assert.deepEqual(db.raw.prepare("SELECT session_id FROM sources").all().map((r) => r.session_id), ["newer"]);
       closeDb(db);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1105,27 +1091,6 @@ describe("ADR-0002: retention cleanup and dead-project sweep", { concurrency: CO
     };
   }
 
-  // D-R4-RETENTION-1: the size cap counts the line units' bytes too, not only sources.bytes_total.
-  test("D-R4-RETENTION-1: RETENTION_SIZE_CAP_BYTES counts line_units bytes: a source with big units is deleted", async () => {
-    const root = mkdtempSync(join(tmpdir(), "cm-cleanup-units-"));
-    try {
-      const project = fakeProject(root, "d".repeat(16));
-      const db = await openDb(project);
-      const now = Date.now();
-      insertSource(db, { session_id: "s1", bytes_total: 1000, accessed_ts: now - 1000 });
-      const srcId = db.raw.prepare("SELECT id FROM sources").get().id;
-      const big = "x".repeat(C.RETENTION_SIZE_CAP_BYTES + 10);
-      db.raw.prepare("INSERT INTO line_units(body, source_id, session_id, ord) VALUES (?, ?, 's1', 0)").run(big, srcId);
-      insertSource(db, { session_id: "s1", bytes_total: 1000, accessed_ts: now });
-      const result = cleanupProject(db, join(root, "cm-config"));
-      assert.ok(result.deletedSources >= 1, "the cap is exceeded by the units, so a source is deleted");
-      const units = db.raw.prepare("SELECT COUNT(*) AS n FROM line_units WHERE source_id = ?").get(srcId).n;
-      assert.equal(units, 0, "the deleted source's line units are gone too");
-      closeDb(db);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
 });
 
 // Serial on purpose: its spy patches DatabaseSync.prototype for the whole process.

@@ -1,5 +1,6 @@
 // PRD-v2 section 10, GP3, GP6, GP7: the hook process. stdin, entry, dispatch, replace and saving, compaction delivery,
 // decisions, errors, throttle and tool names. One file per area (docs/architecture/TEST-LAYOUT.md); a describe per ADR/PRD section.
+import { createHash } from "node:crypto";
 import { test, before, after, describe } from "node:test";
 import { CONC } from "./_lib/concurrency.mjs";
 import assert from "node:assert/strict";
@@ -29,6 +30,27 @@ import { READ_DENY_MESSAGE } from "../src/core/policy/read-deny.ts";
 import { pathToFileURL } from "node:url";
 import { shouldHint } from "../src/core/hooks/throttle.ts";
 import { renderState } from "../src/core/compaction/render.ts";
+
+// Line units live in one FTS5 table per session: lu_ + the first 24 hex of sha1(session id).
+const luName = (sid) => "lu_" + createHash("sha1").update(sid).digest("hex").slice(0, 24);
+const unitsOfSource = (q, id) => {
+  try {
+    const row = q("SELECT session_id FROM sources WHERE id = ?", id)[0];
+    return row === undefined ? [] : q(`SELECT ord FROM "${luName(row.session_id)}" WHERE source_id = ?`, id);
+  } catch { return []; }
+};
+const unitsOfSession = (q, sid) => {
+  try { return q(`SELECT 1 FROM "${luName(sid)}"`); } catch { return []; }
+};
+async function pollUnits(fn, n) {
+  const end = Date.now() + 5000;
+  for (;;) {
+    const rows = fn();
+    if (rows.length >= n || Date.now() > end) return rows;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 
 // serial: sets process.env.HOME in before(); process.env is shared by every test in the file
 describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () => {
@@ -931,7 +953,7 @@ describe("PRD-v2 section 10: dispatch, replace and handle line (GP3, GP6)", () =
     assert.ok(Buffer.byteLength(replaced) <= bound, Buffer.byteLength(replaced) + " > " + bound);
     const chunks = await waitRows("SELECT ord FROM chunks WHERE source_id = ?", [src[0].id], 1);
     assert.ok(chunks.length > 0, "the detached write stores the chunks under the reserved id");
-    const units = await waitRows("SELECT ord FROM line_units WHERE source_id = ?", [src[0].id], 1);
+    const units = await pollUnits(() => unitsOfSource(query, src[0].id), 1);
     assert.ok(units.length > 0, "the detached write stores the line units under the reserved id");
   });
 
@@ -1209,7 +1231,7 @@ describe("PRD-v2 section 10: compaction delivery, recall and decision rows (GP6)
       hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: { command: "cat deploy.log", description: "deploy log" },
       tool_use_id: "toolu_1394", tool_response: { stdout: lines.join("\n"), stderr: "", interrupted: false, isImage: false },
     }), env);
-    await waitRows("SELECT 1 FROM line_units WHERE session_id = ?", [s], lines.length);
+    await pollUnits(() => unitsOfSession(query, s), lines.length);
     const text = context(await handleHook("claude-code", payload(s, { hook_event_name: "UserPromptSubmit", prompt: "why did the walrusbeam deploy roll back on canary-3" }), env));
     assert.ok(text === null || !text.includes(PLANTED), "post-compaction line unit recalled: " + String(text));
   });
@@ -1232,7 +1254,7 @@ describe("PRD-v2 section 10: compaction delivery, recall and decision rows (GP6)
       hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: { command: "cat build.log", description: "build log" },
       tool_use_id: "toolu_1330", tool_response: { stdout: lines.join("\n"), stderr: "", interrupted: false, isImage: false },
     }), env);
-    await waitRows("SELECT 1 FROM line_units WHERE session_id = ?", [s], lines.length);
+    await pollUnits(() => unitsOfSession(query, s), lines.length);
     await handleHook("claude-code", payload(s, { hook_event_name: "SessionStart", source: "compact" }), env);
     const t0 = performance.now();
     const text = context(await handleHook("claude-code", payload(s, { hook_event_name: "UserPromptSubmit", prompt: "why did redis failover exhaust the pool on replica-2" }), env));
@@ -2019,7 +2041,7 @@ describe("PRD-v2 section 10: hook entry argv and stdin handling (GP7)", () => {
     const src = readRows("SELECT id, bytes_total FROM sources WHERE session_id = ?", "lk2");
     assert.deepEqual(src.map((x) => x.bytes_total), [Buffer.byteLength(full)], "one source row for the output");
     assert.ok(readRows("SELECT ord FROM chunks WHERE source_id = ?", src[0].id).length > 0, "chunks stored");
-    assert.ok(readRows("SELECT ord FROM line_units WHERE source_id = ?", src[0].id).length > 0, "line units stored");
+    assert.ok(unitsOfSource(readRows, src[0].id).length > 0, "line units stored");
   });
 
   test("GP7/codex-session-project-dir: codex sessions in X and Y write to their own project", () => {
