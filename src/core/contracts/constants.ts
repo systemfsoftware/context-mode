@@ -169,7 +169,7 @@ export const MS_PER_DAY = 86400000; // DEVIATIONS D-M1-3: day-to-ms factor for t
 
 // Store (impl/02 §0; DEVIATIONS D-M1-3: impl/00 names NODE_MIN and INDEX_WRITE_CHUNK cover the rest)
 export const PROJECT_KEY_HEX_LEN = 16; // impl/00 A5: first 16 hex chars of sha256(git common dir realpath)
-export const SCHEMA_VERSION = 7; // ADR-0002 decision 2: PRAGMA user_version; 2 = cost dedup index (D-M5-arch-2); 3 = chunks title + porter (D-SEARCH-3); 4 = trigram table + vocab (D-SEARCH-4); 5 = line_units (r3-ledger); 6 = path labels with forward slashes (D-PATH-LABEL-1); 7 = line units move to one FTS5 table per session, sources(session_id, id) index
+export const SCHEMA_VERSION = 6; // ADR-0002 decision 2: PRAGMA user_version; 2 = cost dedup index (D-M5-arch-2); 3 = chunks title + porter (D-SEARCH-3); 4 = trigram table + vocab (D-SEARCH-4); 5 = line_units (r3-ledger); 6 = path labels with forward slashes (D-PATH-LABEL-1)
 export const RETENTION_IDLE_DAYS = 7; // a session with no activity for this long is deleted whole (rows, units, journal)
 export const RETENTION_SIZE_CAP_BYTES = 2147483648; // 2 GiB across context.db and the legacy sessions/ dir; least recently active sessions go first
 export const PRUNE_INTERVAL_MS = 3600000; // prune runs out of band in the server, at most hourly; never on a hook

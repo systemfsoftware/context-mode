@@ -876,7 +876,8 @@ export function insertUnits(db: DbHandle, sourceId: number, sessionId: string, u
     }
     const from = start;
     withWrite(db, (h) => {
-      h.raw.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS "${table}" USING fts5(body, source_id UNINDEXED, ord UNINDEXED, ${FTS_TOKENIZE})`);
+      // No schema version change: an older build sharing this store keeps its (now unused) line_units table and keeps working.
+      h.raw.exec(`CREATE INDEX IF NOT EXISTS idx_sources_session_id ON sources(session_id, id); CREATE VIRTUAL TABLE IF NOT EXISTS "${table}" USING fts5(body, source_id UNINDEXED, ord UNINDEXED, ${FTS_TOKENIZE})`);
       const ins = h.raw.prepare(`INSERT INTO "${table}"(body, source_id, ord) VALUES (?, ?, ?)`);
       for (let i = from; i < end; i++) {
         const u = units[i] as { ord: number; body: string };
