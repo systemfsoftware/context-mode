@@ -184,6 +184,7 @@ export async function startServer(argv: string[], env: NodeJS.ProcessEnv): Promi
   // vacuum and checkpoint run hourly (or at once over the high-water mark) and only while IO pressure is below MAINT_PSI_MAX.
   function schedulePrune(db: DbHandle, project: ProjectContext): void {
     let last = 0;
+    let lastPhysical = Infinity; // physical bytes after the previous prune: the over-the-mark fast path needs it to have shrunk
     // The spool is applied every few seconds (a readdir when empty), so a prompt row waits only that long behind the hook.
     setInterval(() => {
       try { drainSpool(project, db); } catch (err) { process.stderr.write("context-mode: spool drain failed: " + (err as Error).message + "\n"); }
@@ -192,11 +193,15 @@ export async function startServer(argv: string[], env: NodeJS.ProcessEnv): Promi
       try {
         const psi = ioPressure();
         if (psi !== null && psi >= MAINT_PSI_MAX) return;
-        const over = physicalBytes(db.path) > STORE_HIGH_BYTES;
+        // Over the high mark prunes at once, but only while the last prune made progress; a store that cannot shrink
+        // (nothing evictable, or pages that do not return) falls back to the hourly cadence instead of spinning.
+        const now = physicalBytes(db.path);
+        const over = now > STORE_HIGH_BYTES && now < lastPhysical;
         if (!over && Date.now() - last < PRUNE_INTERVAL_MS) return;
         last = Date.now();
         const claudeDir = process.env["CLAUDE_CONFIG_DIR"] ?? join(homedir(), ".claude");
         pruneStore(db, { legacyDirs: [join(claudeDir, "context-mode", V1_SESSIONS_DIR_NAME)] });
+        lastPhysical = physicalBytes(db.path);
       } catch (err) {
         process.stderr.write("context-mode: maintenance failed: " + (err as Error).message + "\n");
       }

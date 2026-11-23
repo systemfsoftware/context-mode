@@ -2,8 +2,8 @@
 // pruneStore: session retention + size cap, run out of band against the open project's own DB.
 // sweepDeadProjects: whole-project delete; the live-PID check and the delete decision run in one
 // BEGIN IMMEDIATE (#880 race class). Never on a timer: the caller runs both once (D-M1-11).
-import { existsSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync, rmSync, statfsSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import {
   DB_FILE_NAME,
@@ -11,6 +11,7 @@ import {
   DB_TIMEOUT_MS,
   DB_WAL_SUFFIX,
   INCREMENTAL_VACUUM_BATCH,
+  MAINT_PSI_MAX,
   MS_PER_DAY,
   PROJECT_DEAD_IDLE_DAYS,
   PROJECTS_DIR_NAME,
@@ -109,17 +110,47 @@ function deleteSession(db: DbHandle, session: string): void {
     h.raw.prepare("DELETE FROM sources WHERE session_id = ?").run(session);
     h.raw.prepare("DELETE FROM events WHERE session_id = ?").run(session);
   });
-  db.raw.exec("PRAGMA wal_checkpoint(PASSIVE)");
+  // A WAL past the limit is truncated, not just checkpointed: a PASSIVE checkpoint stops at the oldest open reader's frame.
+  db.raw.exec(fileSize(db.path + DB_WAL_SUFFIX) > WAL_TRUNCATE_BYTES ? "PRAGMA wal_checkpoint(TRUNCATE)" : "PRAGMA wal_checkpoint(PASSIVE)");
 }
 
-/** Return freed pages to the filesystem in small steps (never a full VACUUM, which holds an exclusive lock for the whole file). */
-export function reclaim(db: DbHandle, steps: number = 8): void {
-  for (let i = 0; i < steps; i++) {
-    if (pragmaNumber(db.raw, "freelist_count") === 0) break;
-    db.raw.exec("PRAGMA incremental_vacuum(" + String(INCREMENTAL_VACUUM_BATCH) + ")");
+/**
+ * Return freed pages to the filesystem in steps (never a full VACUUM, which holds an exclusive lock for the whole file),
+ * for at most budgetMs and only while IO pressure is below MAINT_PSI_MAX. Pages move only when the file's auto_vacuum is
+ * INCREMENTAL (2): an older store is at 0 until migrateAutoVacuum rebuilds it once. Returns the pages still free.
+ */
+export function reclaim(db: DbHandle, budgetMs: number = 250, pressure: () => number | null = ioPressure): number {
+  if (pragmaNumber(db.raw, "auto_vacuum") === 2) {
+    const stopAt = performance.now() + budgetMs;
+    while (performance.now() < stopAt && pragmaNumber(db.raw, "freelist_count") > 0) {
+      const psi = pressure();
+      if (psi !== null && psi >= MAINT_PSI_MAX) break;
+      db.raw.exec("PRAGMA incremental_vacuum(" + String(INCREMENTAL_VACUUM_BATCH) + ")");
+    }
   }
-  db.raw.exec("PRAGMA wal_checkpoint(PASSIVE)");
-  if (fileSize(db.path + DB_WAL_SUFFIX) > WAL_TRUNCATE_BYTES) db.raw.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  db.raw.exec(fileSize(db.path + DB_WAL_SUFFIX) > WAL_TRUNCATE_BYTES ? "PRAGMA wal_checkpoint(TRUNCATE)" : "PRAGMA wal_checkpoint(PASSIVE)");
+  return pragmaNumber(db.raw, "freelist_count");
+}
+
+/**
+ * One-time rebuild of a store created without INCREMENTAL auto_vacuum (SQLite applies the setting only at creation or
+ * through VACUUM). Runs only while IO pressure is below MAINT_PSI_MAX and the volume has room for a second copy; the
+ * VACUUM is one atomic transaction, so a failure leaves the old file. Returns whether the store is INCREMENTAL now.
+ */
+export function migrateAutoVacuum(db: DbHandle, pressure: () => number | null = ioPressure): boolean {
+  if (pragmaNumber(db.raw, "auto_vacuum") === 2) return true;
+  const psi = pressure();
+  if (psi !== null && psi >= MAINT_PSI_MAX) return false;
+  try {
+    const fs = statfsSync(dirname(db.path));
+    if (Number(fs.bavail) * Number(fs.bsize) < 2 * fileSize(db.path)) return false;
+  } catch {
+    return false;
+  }
+  db.raw.exec("PRAGMA auto_vacuum = INCREMENTAL");
+  db.raw.exec("VACUUM");
+  db.raw.exec("PRAGMA wal_checkpoint(TRUNCATE)"); // in WAL mode the rebuilt file sits in the log until it is checkpointed
+  return pragmaNumber(db.raw, "auto_vacuum") === 2;
 }
 
 /**
@@ -174,6 +205,7 @@ export function pruneStore(db: DbHandle, opts: PruneOptions = {}): PruneResult {
       sessionsDeleted += 1;
     }
   }
+  migrateAutoVacuum(db);
   reclaim(db);
   return { sessionsDeleted, legacyFilesDeleted, physicalBytes: physicalBytes(db.path) + legacyBytes, liveBytes: liveBytes(db.raw) + legacyBytes };
 }

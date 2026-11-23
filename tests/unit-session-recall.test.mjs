@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -205,4 +205,51 @@ test("the hot window searches only the session's newest rows and loses none insi
     assert.equal(unitQuery(ro.raw, { ...q, window: 8000 }).length, 300, "a window wider than the table loses nothing");
     closeDb(ro);
   });
+});
+
+test("a prompt on a project with no store yet is allowed: recall fails open instead of failing the hook", async () => {
+  const { handleHook } = await import("../src/core/hooks/dispatch.ts");
+  const root = mkdtempSync(join(tmpdir(), "cm-failopen-"));
+  const old = process.env.HOME;
+  try {
+    const out = await handleHook("claude-code", { hook_event_name: "UserPromptSubmit", session_id: "s-new", cwd: root, prompt: "what did the deploy script print earlier" }, { HOME: root, USERPROFILE: root, CLAUDE_PROJECT_DIR: root, PATH: process.env.PATH });
+    assert.deepEqual(out, { stdout: "", exitCode: 0 });
+  } finally {
+    process.env.HOME = old;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a store created without INCREMENTAL auto_vacuum is rebuilt once, then reclaim returns freed pages to the filesystem", async () => {
+  const { migrateAutoVacuum, reclaim } = await import("../src/core/store/cleanup.ts");
+  const { DatabaseSync } = await import("node:sqlite");
+  const root = mkdtempSync(join(tmpdir(), "cm-av-"));
+  try {
+    const path = join(root, "context.db");
+    const raw = new DatabaseSync(path);
+    raw.exec("PRAGMA journal_mode = WAL; CREATE TABLE t(x BLOB)");
+    const ins = raw.prepare("INSERT INTO t VALUES (?)");
+    for (let i = 0; i < 400; i++) ins.run(Buffer.alloc(8192, i));
+    raw.exec("DELETE FROM t; PRAGMA wal_checkpoint(TRUNCATE)");
+    const before = statSync(path).size;
+    const db = { raw, path, projectKey: "k" };
+    assert.equal(raw.prepare("PRAGMA auto_vacuum").get().auto_vacuum, 0);
+    assert.ok(raw.prepare("PRAGMA freelist_count").get().freelist_count > 0);
+    // At auto_vacuum 0 reclaim cannot shrink the file: it leaves the free pages (the P0 a pruning loop depended on).
+    reclaim(db);
+    assert.equal(statSync(path).size, before);
+    assert.equal(migrateAutoVacuum(db, () => 95), false, "a busy disk defers the rebuild");
+    assert.equal(raw.prepare("PRAGMA auto_vacuum").get().auto_vacuum, 0);
+    assert.equal(migrateAutoVacuum(db, () => 0), true);
+    assert.equal(raw.prepare("PRAGMA auto_vacuum").get().auto_vacuum, 2);
+    assert.ok(statSync(path).size < before / 4, "the rebuild returned the free pages");
+    // Now deletes free pages that reclaim returns.
+    for (let i = 0; i < 400; i++) ins.run(Buffer.alloc(8192, i));
+    raw.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    const full = statSync(path).size;
+    raw.exec("DELETE FROM t; PRAGMA wal_checkpoint(TRUNCATE)");
+    reclaim(db, 1000, () => 0);
+    assert.ok(statSync(path).size < full / 4, "reclaim shrank the file");
+    raw.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -24,7 +24,7 @@ import { readUserDeny } from "../policy/user-deny.ts";
 import { resolveProject } from "../project/resolve.ts";
 import { claudeDirOf, homeDirOf } from "../project/config-dir.ts";
 import { isInside } from "../project/contain.ts";
-import { metaGet, metaSet, metaTake, openDb } from "../store/db.ts";
+import { closeDb, metaGet, metaSet, metaTake, openDb } from "../store/db.ts";
 import { canonicalKey } from "../journal/append.ts";
 import { hasAgentRows, hasSessionRows, lastSessionSeq, readLastPrompt, readMaxSeq, readRecallRows, readSessionEvents } from "../journal/read.ts";
 import { readMaxSourceId, recallQueryText, unitMatch, reserveSource, sourceHandle, type SourceDraft } from "../store/fts.ts";
@@ -206,7 +206,8 @@ async function userPromptSubmit(ev: CanonicalHookEvent, row: AdapterRow, project
   if (row.compactDelivery === "pending-flag") {
     const db = await hookDb(project);
     // §4.4 step 2.2: DELETE ... RETURNING inside BEGIN IMMEDIATE, so the delivery fires once.
-    if (metaTake(db, PENDING_COMPACT_META_PREFIX + ev.sessionId) !== null) {
+    // A prompt with no pending compaction stays read-only: the write lock is taken only when the flag exists.
+    if (metaGet(db, PENDING_COMPACT_META_PREFIX + ev.sessionId) !== null && metaTake(db, PENDING_COMPACT_META_PREFIX + ev.sessionId) !== null) {
       drain(project, db);
       return { kind: "hint", text: compactText(db, ev, row), onceKey: PENDING_COMPACT_KEY };
     }
@@ -285,34 +286,53 @@ async function recall(ev: CanonicalHookEvent, row: AdapterRow, project: ProjectC
     return ALLOW;
   }
   // The prompt path only reads: a read-only connection, and every write (the seen markers) goes to the spool, applied after the answer is out.
+  // Recall fails open: a store that cannot be opened or read in time is no recall, never a failed hook.
   const opened = performance.now();
-  const db = await openDb(project, { readOnly: true });
-  db.raw.exec("PRAGMA query_only = ON; PRAGMA busy_timeout = " + String(RECALL_READ_BUSY_MS) + "; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -16384");
-  telemetryDb(project.dbPath);
-  telemetryPhase("db_open", performance.now() - opened);
-  const compacted = metaGet(db, COMPACTED_META_PREFIX + ev.sessionId);
-  if (compacted === null) return ALLOW;
-  const boundary = compactBoundary(compacted);
-  const seenKey = RECALL_SEEN_META_PREFIX + ev.sessionId;
-  const seen = seenSeqs(spooledMeta(project, seenKey) ?? metaGet(db, seenKey));
-  // r3-ledger: one ranked query over this session's line units, by the current prompt only (D-1330-RECALL-PROMPT-1).
-  const unitsKey = RECALL_UNITS_SEEN_META_PREFIX + ev.sessionId;
-  const seenUnits = seenUnitKeys(spooledMeta(project, unitsKey) ?? metaGet(db, unitsKey));
-  // Tier 1: this session's units, under the governor. Tier 2: the worktree's journal rows, only while budget is left.
-  const t1 = recallTierOne(db, { sessionId: ev.sessionId, match: unitMatch(recallQueryText(prompt)), maxSourceId: boundary.source, limit: RECALL_UNIT_CANDIDATES, prelimit: RECALL_PRELIMIT }, recallBudgetMs());
-  telemetryPhase("recall_t1", t1.ms);
-  let rows: ReturnType<typeof readRecallRows> = [];
-  if (recallBudgetMs() >= RECALL_TIER2_MIN_MS) {
-    const t2 = performance.now();
-    rows = readRecallRows(db, ev.sessionId, project.worktree, RECALL_MAX_ROWS, boundary.seq);
-    telemetryPhase("recall_t2", performance.now() - t2);
+  let db: DbHandle;
+  try {
+    db = await openDb(project, { readOnly: true, timeoutMs: RECALL_READ_BUSY_MS });
+  } catch {
+    telemetryRecall({ skip: "unavailable" });
+    return ALLOW;
   }
-  const picked = pickRecall(rows, prompt, new Set(seen), t1.units, new Set(seenUnits));
-  telemetryRecall({ interrupted: t1.interrupted, hits: t1.units.length });
-  if (picked.text === "") return ALLOW;
-  if (picked.seqs.length > 0) spool(project, { t: "meta", key: seenKey, value: JSON.stringify([...seen, ...picked.seqs]) });
-  if (picked.units !== undefined) spool(project, { t: "meta", key: unitsKey, value: JSON.stringify([...seenUnits, ...picked.units]) });
-  return { kind: "hint", text: picked.text, onceKey: RECALL_KEY };
+  try {
+    db.raw.exec("PRAGMA query_only = ON; PRAGMA busy_timeout = " + String(RECALL_READ_BUSY_MS) + "; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -16384");
+    telemetryDb(project.dbPath);
+    telemetryPhase("db_open", performance.now() - opened);
+    const compacted = metaGet(db, COMPACTED_META_PREFIX + ev.sessionId);
+    if (compacted === null) return ALLOW;
+    const boundary = compactBoundary(compacted);
+    const seenKey = RECALL_SEEN_META_PREFIX + ev.sessionId;
+    const seen = seenSeqs(spooledMeta(project, seenKey) ?? metaGet(db, seenKey));
+    // r3-ledger: one ranked query over this session's line units, by the current prompt only (D-1330-RECALL-PROMPT-1).
+    const unitsKey = RECALL_UNITS_SEEN_META_PREFIX + ev.sessionId;
+    const seenUnits = seenUnitKeys(spooledMeta(project, unitsKey) ?? metaGet(db, unitsKey));
+    // Tier 1: this session's units, under the governor. Tier 2: the worktree's journal rows, only while budget is left.
+    const t1 = recallTierOne(db, { sessionId: ev.sessionId, match: unitMatch(recallQueryText(prompt)), maxSourceId: boundary.source, limit: RECALL_UNIT_CANDIDATES, prelimit: RECALL_PRELIMIT }, recallBudgetMs());
+    telemetryPhase("recall_t1", t1.ms);
+    let rows: ReturnType<typeof readRecallRows> = [];
+    if (recallBudgetMs() >= RECALL_TIER2_MIN_MS) {
+      const t2 = performance.now();
+      rows = readRecallRows(db, ev.sessionId, project.worktree, RECALL_MAX_ROWS, boundary.seq);
+      telemetryPhase("recall_t2", performance.now() - t2);
+    }
+    const picked = pickRecall(rows, prompt, new Set(seen), t1.units, new Set(seenUnits));
+    telemetryRecall({ interrupted: t1.interrupted, hits: t1.units.length });
+    if (picked.text === "") return ALLOW;
+    try {
+      if (picked.seqs.length > 0) spool(project, { t: "meta", key: seenKey, value: JSON.stringify([...seen, ...picked.seqs]) });
+      if (picked.units !== undefined) spool(project, { t: "meta", key: unitsKey, value: JSON.stringify([...seenUnits, ...picked.units]) });
+    } catch (err) {
+      process.stderr.write("hooks: recall markers not spooled: " + message(err) + "\n");
+    }
+    return { kind: "hint", text: picked.text, onceKey: RECALL_KEY };
+  } catch (err) {
+    process.stderr.write("hooks: recall failed: " + message(err) + "\n");
+    telemetryRecall({ skip: "error" });
+    return ALLOW;
+  } finally {
+    closeDb(db);
+  }
 }
 
 // ---------- ADR-0009 §8.2 decision rows (D-M4-arch-5, D-M4-H2-2) ----------

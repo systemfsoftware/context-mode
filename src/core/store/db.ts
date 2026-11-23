@@ -144,8 +144,8 @@ function openWritable(sqlite: SqliteModule, path: string): DatabaseSync {
 }
 
 // Read-only open (D-M1-T5-1): never migrates; a schema other than SCHEMA_VERSION is SCHEMA_STALE.
-function openReadOnly(sqlite: SqliteModule, path: string): DatabaseSync {
-  const raw = openReadOnlyHandle(sqlite, path); // D-R44-OC-SQLITE-RO-1
+function openReadOnly(sqlite: SqliteModule, path: string, timeoutMs?: number): DatabaseSync {
+  const raw = openReadOnlyHandle(sqlite, path, timeoutMs === undefined ? {} : { timeoutMs }); // D-R44-OC-SQLITE-RO-1
   try {
     const found = readUserVersion(raw);
     if (found !== SCHEMA_VERSION) throw new CtxError("SCHEMA_STALE", { found, want: SCHEMA_VERSION });
@@ -156,7 +156,7 @@ function openReadOnly(sqlite: SqliteModule, path: string): DatabaseSync {
   }
 }
 
-export async function openDb(project: ProjectContext, opts?: { readOnly?: boolean }): Promise<DbHandle> {
+export async function openDb(project: ProjectContext, opts?: { readOnly?: boolean; timeoutMs?: number }): Promise<DbHandle> {
   // Step 1: Node version gate.
   if (isBelow(process.version, NODE_MIN)) throw new CtxError("NODE_TOO_OLD", { v: process.version });
   const sqlite = await loadSqlite();
@@ -179,7 +179,7 @@ export async function openDb(project: ProjectContext, opts?: { readOnly?: boolea
     if (opts?.readOnly === true) {
       // A read-only open cannot create the file; the first open of a project creates it once.
       if (!existsSync(path)) openWritable(sqlite, path).close();
-      raw = openReadOnly(sqlite, path);
+      raw = openReadOnly(sqlite, path, opts.timeoutMs);
     } else {
       raw = openWritable(sqlite, path);
     }
